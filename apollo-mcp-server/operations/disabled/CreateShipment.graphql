@@ -1,0 +1,49 @@
+# Tool: create_shipment
+# Creates a new shipment record and returns the assigned tracking number.
+mutation CreateShipment(
+  $originWarehouseId: ID!
+  $destinationStreet: String
+  $destinationCity: String!
+  $destinationState: String
+  $destinationCountry: String!
+  $destinationPostalCode: String!
+  $items: [ShipmentItemInput!]!
+  $priority: ShipmentPriority!
+  $scheduledPickup: String
+  $specialInstructions: String
+) {
+  createShipment(
+    input: {
+      originWarehouseId: $originWarehouseId
+      destinationAddress: {
+        street: $destinationStreet
+        city: $destinationCity
+        state: $destinationState
+        country: $destinationCountry
+        postalCode: $destinationPostalCode
+      }
+      items: $items
+      priority: $priority
+      scheduledPickup: $scheduledPickup
+      specialInstructions: $specialInstructions
+    }
+  ) {
+    id
+    trackingNumber
+    status
+    priority
+    originWarehouseId
+    totalWeight
+    totalVolume
+    totalValue
+    estimatedDelivery
+    createdAt
+    destinationAddress {
+      street
+      city
+      state
+      country
+      postalCode
+    }
+  }
+}

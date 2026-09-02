@@ -1,0 +1,53 @@
+spring:
+  application:
+    name: route-service
+  jpa:
+    hibernate:
+      ddl-auto: validate
+    properties:
+      hibernate:
+        default_schema: route
+    open-in-view: false
+  flyway:
+    enabled: true
+    default-schema: route
+    schemas: route
+    locations: classpath:db/migration
+    baseline-on-migrate: true
+  graphql:
+    graphiql:
+      enabled: true
+    path: /graphql
+    schema:
+      locations: classpath:graphql/
+
+server:
+  port: 8082
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics
+
+---
+spring:
+  config:
+    activate:
+      on-profile: local
+  datasource:
+    url: jdbc:postgresql://localhost:5432/shipment_planner?currentSchema=route
+    username: route_svc
+    password: route_pass
+    driver-class-name: org.postgresql.Driver
+
+---
+spring:
+  config:
+    activate:
+      on-profile: docker
+  datasource:
+    url: jdbc:postgresql://postgres:5432/shipment_planner?currentSchema=route
+    username: route_svc
+    password: route_pass
+    driver-class-name: org.postgresql.Driver

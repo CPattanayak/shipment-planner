@@ -1,0 +1,12 @@
+# Node / React
+react-ui/node_modules
+react-ui/.next
+react-ui/dist
+
+# Maven build artifacts (still allows src/ and pom.xml)
+domain-services/*/target
+
+# Misc
+**/*.md
+.git
+.env

@@ -1,0 +1,403 @@
+schema
+  @link(url: "https://specs.apollo.dev/link/v1.0")
+  @link(url: "https://specs.apollo.dev/join/v0.3", for: EXECUTION)
+{
+  query: Query
+  mutation: Mutation
+}
+
+directive @join__enumValue(graph: join__Graph!) repeatable on ENUM_VALUE
+directive @join__field(graph: join__Graph, requires: join__FieldSet, provides: join__FieldSet, type: String, external: Boolean, override: String, usedOverridden: Boolean) repeatable on FIELD_DEFINITION | INPUT_FIELD_DEFINITION
+directive @join__graph(name: String!, url: String!) on ENUM_VALUE
+directive @join__implements(graph: join__Graph!, interface: String!) repeatable on OBJECT | INTERFACE
+directive @join__type(graph: join__Graph!, key: join__FieldSet, extension: Boolean! = false, resolvable: Boolean! = true, isInterfaceObject: Boolean! = false) repeatable on OBJECT | INTERFACE | UNION | ENUM | INPUT_OBJECT | SCALAR
+directive @join__unionMember(graph: join__Graph!, member: String!) repeatable on UNION
+directive @link(url: String, as: String, for: link__Purpose, import: [link__Import]) repeatable on SCHEMA
+
+scalar join__FieldSet
+scalar link__Import
+enum link__Purpose { SECURITY EXECUTION }
+
+enum join__Graph {
+  SHIPMENT  @join__graph(name: "shipment",  url: "http://shipment-service:8081/graphql")
+  ROUTE     @join__graph(name: "route",     url: "http://route-service:8082/graphql")
+  CARRIER   @join__graph(name: "carrier",   url: "http://carrier-service:8083/graphql")
+  WAREHOUSE @join__graph(name: "warehouse", url: "http://warehouse-service:8084/graphql")
+}
+
+# ── Shared scalars / enums ────────────────────────────────────────────────────
+
+enum ShipmentStatus
+  @join__type(graph: SHIPMENT)
+{
+  DRAFT           @join__enumValue(graph: SHIPMENT)
+  PENDING_CARRIER @join__enumValue(graph: SHIPMENT)
+  CARRIER_CONFIRMED @join__enumValue(graph: SHIPMENT)
+  PICKUP_SCHEDULED @join__enumValue(graph: SHIPMENT)
+  IN_TRANSIT      @join__enumValue(graph: SHIPMENT)
+  OUT_FOR_DELIVERY @join__enumValue(graph: SHIPMENT)
+  DELIVERED       @join__enumValue(graph: SHIPMENT)
+  EXCEPTION       @join__enumValue(graph: SHIPMENT)
+  CANCELLED       @join__enumValue(graph: SHIPMENT)
+}
+
+enum ShipmentPriority
+  @join__type(graph: SHIPMENT)
+{
+  STANDARD  @join__enumValue(graph: SHIPMENT)
+  EXPRESS   @join__enumValue(graph: SHIPMENT)
+  OVERNIGHT @join__enumValue(graph: SHIPMENT)
+  SAME_DAY  @join__enumValue(graph: SHIPMENT)
+}
+
+enum RouteStatus
+  @join__type(graph: ROUTE)
+{
+  ACTIVE      @join__enumValue(graph: ROUTE)
+  INACTIVE    @join__enumValue(graph: ROUTE)
+  MAINTENANCE @join__enumValue(graph: ROUTE)
+}
+
+enum TransportMode
+  @join__type(graph: ROUTE)
+{
+  ROAD      @join__enumValue(graph: ROUTE)
+  RAIL      @join__enumValue(graph: ROUTE)
+  AIR       @join__enumValue(graph: ROUTE)
+  SEA       @join__enumValue(graph: ROUTE)
+  MULTIMODAL @join__enumValue(graph: ROUTE)
+}
+
+enum WaypointType
+  @join__type(graph: ROUTE)
+{
+  ORIGIN      @join__enumValue(graph: ROUTE)
+  TRANSIT     @join__enumValue(graph: ROUTE)
+  HUB         @join__enumValue(graph: ROUTE)
+  DESTINATION @join__enumValue(graph: ROUTE)
+}
+
+enum DockSlotType
+  @join__type(graph: WAREHOUSE)
+{
+  PICKUP   @join__enumValue(graph: WAREHOUSE)
+  DELIVERY @join__enumValue(graph: WAREHOUSE)
+}
+
+enum DockSlotStatus
+  @join__type(graph: WAREHOUSE)
+{
+  AVAILABLE  @join__enumValue(graph: WAREHOUSE)
+  BOOKED     @join__enumValue(graph: WAREHOUSE)
+  COMPLETED  @join__enumValue(graph: WAREHOUSE)
+  CANCELLED  @join__enumValue(graph: WAREHOUSE)
+}
+
+# ── Value types ───────────────────────────────────────────────────────────────
+
+type Address
+  @join__type(graph: SHIPMENT)
+{
+  street:      String
+  city:        String!
+  state:       String
+  country:     String!
+  postalCode:  String!
+  coordinates: GeoCoordinates
+}
+
+type GeoCoordinates
+  @join__type(graph: SHIPMENT)
+{
+  lat: Float!
+  lng: Float!
+}
+
+type StatusEvent
+  @join__type(graph: SHIPMENT)
+{
+  status:    ShipmentStatus!
+  timestamp: String!
+  location:  String
+  notes:     String
+}
+
+type CarrierCapabilities
+  @join__type(graph: CARRIER)
+{
+  maxWeightKg:          Float!
+  maxVolumeM3:          Float!
+  hazardousAllowed:     Boolean!
+  temperatureControlled: Boolean!
+  expressAvailable:     Boolean!
+  overnightAvailable:   Boolean!
+  sameDayAvailable:     Boolean!
+  trackingAvailable:    Boolean!
+}
+
+type CarrierPerformance
+  @join__type(graph: CARRIER)
+{
+  onTimeDeliveryRate:  Float!
+  averageDelayHours:   Float!
+  damageRate:          Float!
+  customerSatisfaction: Float!
+  totalShipments:      Int!
+}
+
+type RouteRestrictions
+  @join__type(graph: ROUTE)
+{
+  hazardousAllowed:      Boolean!
+  temperatureControlled: Boolean!
+  maxItemValueUsd:       Float
+  countries:             [String!]!
+}
+
+type Waypoint
+  @join__type(graph: ROUTE)
+{
+  sequence:         Int!
+  location:         String!
+  lat:              Float
+  lng:              Float
+  estimatedArrival: String
+  type:             WaypointType!
+}
+
+type WarehouseAddress
+  @join__type(graph: WAREHOUSE)
+{
+  street:     String
+  city:       String!
+  state:      String
+  country:    String!
+  postalCode: String!
+  lat:        Float
+  lng:        Float
+}
+
+# ── Entity types ──────────────────────────────────────────────────────────────
+
+type Shipment
+  @join__type(graph: SHIPMENT, key: "id")
+{
+  id:                  ID!
+  trackingNumber:      String!
+  status:              ShipmentStatus!
+  priority:            ShipmentPriority!
+  originWarehouseId:   ID!
+  destinationAddress:  Address!
+  items:               [ShipmentItem!]!
+  totalWeight:         Float!
+  totalVolume:         Float!
+  totalValue:          Float!
+  carrierId:           ID
+  routeId:             ID
+  estimatedDelivery:   String
+  actualDelivery:      String
+  scheduledPickup:     String
+  specialInstructions: String
+  statusHistory:       [StatusEvent!]!
+  createdAt:           String!
+  updatedAt:           String!
+}
+
+type ShipmentItem
+  @join__type(graph: SHIPMENT)
+{
+  id:                   ID!
+  sku:                  String!
+  description:          String!
+  quantity:             Int!
+  weight:               Float!
+  volume:               Float!
+  value:                Float!
+  hazardous:            Boolean!
+  temperatureControlled: Boolean!
+  fragile:              Boolean!
+}
+
+type Carrier
+  @join__type(graph: CARRIER, key: "id")
+{
+  id:             ID!
+  name:           String!
+  code:           String!
+  active:         Boolean!
+  supportedModes: [String!]!
+  serviceAreas:   [String!]!
+  capabilities:   CarrierCapabilities!
+  performance:    CarrierPerformance!
+  contactEmail:   String
+}
+
+type CarrierQuote
+  @join__type(graph: CARRIER)
+{
+  carrierId:     ID!
+  carrierName:   String!
+  baseRate:      Float!
+  fuelSurcharge: Float!
+  handlingFee:   Float!
+  totalCost:     Float!
+  transitDays:   Int!
+  serviceLevel:  String!
+  validUntil:    String!
+}
+
+type CarrierBooking
+  @join__type(graph: CARRIER)
+{
+  bookingId:         ID!
+  carrierId:         ID!
+  shipmentId:        ID!
+  confirmedAt:       String!
+  pickupWindow:      String!
+  estimatedDelivery: String!
+  trackingNumber:    String!
+}
+
+type Route
+  @join__type(graph: ROUTE, key: "id")
+{
+  id:                     ID!
+  name:                   String!
+  originWarehouseId:      ID!
+  destinationPostalCode:  String!
+  status:                 RouteStatus!
+  transportMode:          TransportMode!
+  totalDistanceKm:        Float!
+  estimatedDurationHours: Float!
+  costPerKg:              Float!
+  maxWeightKg:            Float!
+  maxVolumeM3:            Float!
+  carrierIds:             [ID!]!
+  restrictions:           RouteRestrictions!
+  waypoints:              [Waypoint!]!
+}
+
+type RouteOptimizationResult
+  @join__type(graph: ROUTE)
+{
+  recommendedRoute:     Route!
+  alternatives:         [Route!]!
+  estimatedCost:        Float!
+  estimatedDeliveryDate: String!
+  carbonFootprintKg:    Float!
+  reasoning:            String!
+}
+
+type Warehouse
+  @join__type(graph: WAREHOUSE, key: "id")
+{
+  id:             ID!
+  code:           String!
+  name:           String!
+  address:        WarehouseAddress!
+  capacityM3:     Float!
+  usedM3:         Float!
+  availableM3:    Float!
+  utilizationPct: Float!
+  active:         Boolean!
+  capabilities:   [String!]!
+  contactEmail:   String
+}
+
+type DockSlot
+  @join__type(graph: WAREHOUSE)
+{
+  id:          ID!
+  warehouseId: ID!
+  dockNumber:  Int!
+  date:        String!
+  startTime:   String!
+  endTime:     String!
+  shipmentId:  ID
+  type:        DockSlotType!
+  status:      DockSlotStatus!
+}
+
+type CapacitySummary
+  @join__type(graph: WAREHOUSE)
+{
+  warehouseId:      ID!
+  totalM3:          Float!
+  usedM3:           Float!
+  availableM3:      Float!
+  utilizationPct:   Float!
+  pendingShipments: Int!
+}
+
+# ── Input types ───────────────────────────────────────────────────────────────
+
+input AddressInput             @join__type(graph: SHIPMENT) { street: String  city: String!  state: String  country: String!  postalCode: String! }
+input ShipmentItemInput        @join__type(graph: SHIPMENT) { sku: String!  description: String!  quantity: Int!  weight: Float!  volume: Float!  value: Float!  hazardous: Boolean = false  temperatureControlled: Boolean = false  fragile: Boolean = false }
+input CreateShipmentInput      @join__type(graph: SHIPMENT) { originWarehouseId: ID!  destinationAddress: AddressInput!  items: [ShipmentItemInput!]!  priority: ShipmentPriority!  scheduledPickup: String  specialInstructions: String }
+input AvailabilityInput        @join__type(graph: CARRIER)  { originPostalCode: String!  destinationPostalCode: String!  weightKg: Float!  hasHazardous: Boolean!  requiresTemperatureControl: Boolean!  serviceLevel: String! }
+input QuoteInput               @join__type(graph: CARRIER)  { carrierId: ID!  originPostalCode: String!  destinationPostalCode: String!  weightKg: Float!  volumeM3: Float!  serviceLevel: String! }
+input CreateCarrierInput       @join__type(graph: CARRIER)  { name: String!  code: String!  contactEmail: String  supportedModes: [String!]!  serviceAreas: [String!]! }
+input BookingInput             @join__type(graph: CARRIER)  { carrierId: ID!  shipmentId: ID!  serviceLevel: String!  requestedPickupDate: String! }
+input RouteOptimizationInput   @join__type(graph: ROUTE)    { originWarehouseId: ID!  destinationPostalCode: String!  destinationCountry: String!  weightKg: Float!  volumeM3: Float!  totalValueUsd: Float!  hasHazardous: Boolean!  requiresTemperatureControl: Boolean!  requiredDeliveryDate: String  priority: String! }
+input CreateRouteInput         @join__type(graph: ROUTE)    { name: String!  originWarehouseId: ID!  destinationPostalCode: String!  transportMode: TransportMode!  totalDistanceKm: Float!  estimatedDurationHours: Float!  costPerKg: Float!  maxWeightKg: Float!  maxVolumeM3: Float!  carrierIds: [ID!] }
+input DockBookingInput         @join__type(graph: WAREHOUSE) { warehouseId: ID!  dockNumber: Int!  date: String!  startTime: String!  endTime: String!  shipmentId: ID!  type: DockSlotType! }
+
+# ── Root types ────────────────────────────────────────────────────────────────
+
+type Query
+  @join__type(graph: SHIPMENT)
+  @join__type(graph: CARRIER)
+  @join__type(graph: ROUTE)
+  @join__type(graph: WAREHOUSE)
+{
+  # Shipment subgraph
+  shipment(id: ID!):                                              Shipment          @join__field(graph: SHIPMENT)
+  shipments(status: ShipmentStatus, limit: Int = 20, offset: Int = 0): [Shipment!]! @join__field(graph: SHIPMENT)
+  shipmentsByOrigin(warehouseId: ID!):                           [Shipment!]!      @join__field(graph: SHIPMENT)
+  shipmentsByCarrier(carrierId: ID!):                            [Shipment!]!      @join__field(graph: SHIPMENT)
+
+  # Carrier subgraph
+  carrier(id: ID!):                                               Carrier           @join__field(graph: CARRIER)
+  carriers(activeOnly: Boolean = true):                          [Carrier!]!       @join__field(graph: CARRIER)
+  availableCarriers(input: AvailabilityInput!):                  [Carrier!]!       @join__field(graph: CARRIER)
+  carrierQuote(input: QuoteInput!):                              CarrierQuote!     @join__field(graph: CARRIER)
+
+  # Route subgraph
+  route(id: ID!):                                                 Route             @join__field(graph: ROUTE)
+  availableRoutes(originWarehouseId: ID!, destinationPostalCode: String!): [Route!]! @join__field(graph: ROUTE)
+  optimizeRoute(input: RouteOptimizationInput!):                 RouteOptimizationResult! @join__field(graph: ROUTE)
+
+  # Warehouse subgraph
+  warehouse(id: ID!):                                             Warehouse         @join__field(graph: WAREHOUSE)
+  warehouses(activeOnly: Boolean = true):                        [Warehouse!]!     @join__field(graph: WAREHOUSE)
+  availableDockSlots(warehouseId: ID!, date: String!):           [DockSlot!]!      @join__field(graph: WAREHOUSE)
+  warehouseCapacity(id: ID!):                                    CapacitySummary!  @join__field(graph: WAREHOUSE)
+}
+
+type Mutation
+  @join__type(graph: SHIPMENT)
+  @join__type(graph: CARRIER)
+  @join__type(graph: ROUTE)
+  @join__type(graph: WAREHOUSE)
+{
+  # Shipment subgraph
+  createShipment(input: CreateShipmentInput!):                   Shipment!         @join__field(graph: SHIPMENT)
+  updateShipmentStatus(id: ID!, status: ShipmentStatus!, notes: String): Shipment! @join__field(graph: SHIPMENT)
+  assignCarrier(shipmentId: ID!, carrierId: ID!):                Shipment!         @join__field(graph: SHIPMENT)
+  assignRoute(shipmentId: ID!, routeId: ID!):                    Shipment!         @join__field(graph: SHIPMENT)
+  cancelShipment(id: ID!, reason: String!):                      Shipment!         @join__field(graph: SHIPMENT)
+
+  # Carrier subgraph
+  createCarrier(input: CreateCarrierInput!):                     Carrier!          @join__field(graph: CARRIER)
+  setCarrierActive(id: ID!, active: Boolean!):                   Carrier!          @join__field(graph: CARRIER)
+  bookCarrier(input: BookingInput!):                             CarrierBooking!   @join__field(graph: CARRIER)
+
+  # Route subgraph
+  createRoute(input: CreateRouteInput!):                         Route!            @join__field(graph: ROUTE)
+  setRouteStatus(id: ID!, status: RouteStatus!):                 Route!            @join__field(graph: ROUTE)
+
+  # Warehouse subgraph
+  bookDockSlot(input: DockBookingInput!):                        DockSlot!         @join__field(graph: WAREHOUSE)
+  releaseDockSlot(slotId: ID!):                                  DockSlot!         @join__field(graph: WAREHOUSE)
+  updateCapacity(warehouseId: ID!, usedM3: Float!):              Warehouse!        @join__field(graph: WAREHOUSE)
+}

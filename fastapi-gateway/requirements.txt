@@ -1,0 +1,22 @@
+# ── Web framework ─────────────────────────────────────────────────────────────
+fastapi
+uvicorn[standard]
+httpx
+pydantic>=2.7.4
+python-dotenv
+sse-starlette
+
+# ── LangChain / LangGraph / MCP ecosystem ────────────────────────────────────
+#
+# langchain-mcp-adapters==0.2.1 uses mcp 1.x internals:
+#   mcp.shared.context.RequestContext, mcp.shared.session.ProgressFnT,
+#   StreamableHTTPTransport._handle_sse_event.
+# mcp 2.x restructured all of these → cap at <2.0.0 so pip stays on 1.x.
+# 0.3.0+ of langchain-mcp-adapters require a renamed API in mcp 1.x
+# (streamable_http_client vs streamablehttp_client) → pin exactly 0.2.1.
+
+mcp>=1.0.0,<2.0.0
+langchain-mcp-adapters==0.2.1
+langgraph>=0.2.0
+langchain-core>=0.3.0
+langchain-openai>=0.2.0

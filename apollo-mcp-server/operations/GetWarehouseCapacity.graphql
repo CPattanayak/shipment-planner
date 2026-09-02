@@ -1,0 +1,24 @@
+# Tool: get_warehouse_capacity
+# Returns a detailed capacity summary AND address for a specific warehouse.
+# The warehouse.address.postalCode is the originPostalCode for carrier/route lookups.
+query GetWarehouseCapacity($id: ID!) {
+  warehouseCapacity(id: $id) {
+    warehouseId
+    totalM3
+    usedM3
+    availableM3
+    utilizationPct
+    pendingShipments
+  }
+  warehouse(id: $id) {
+    id
+    name
+    address {
+      street
+      city
+      state
+      country
+      postalCode
+    }
+  }
+}

@@ -1,0 +1,97 @@
+# ── Apollo Federation v2 directive declarations ───────────────────────────────
+# graphql-java requires all directives to be declared before use.
+directive @key(fields: String!, resolvable: Boolean) repeatable on OBJECT | INTERFACE
+directive @shareable repeatable on OBJECT | FIELD_DEFINITION
+directive @link(url: String!, import: [String]) repeatable on SCHEMA
+directive @external on OBJECT | FIELD_DEFINITION
+directive @requires(fields: String!) on FIELD_DEFINITION
+directive @provides(fields: String!) on FIELD_DEFINITION
+directive @override(from: String!) on FIELD_DEFINITION
+directive @inaccessible on FIELD_DEFINITION | OBJECT | INTERFACE | UNION | ARGUMENT_DEFINITION | SCALAR | ENUM | ENUM_VALUE | INPUT_OBJECT | INPUT_FIELD_DEFINITION
+
+extend schema
+  @link(url: "https://specs.apollo.dev/federation/v2.3",
+        import: ["@key", "@shareable"])
+
+type Query {
+  route(id: ID!): Route
+  availableRoutes(originWarehouseId: ID!, destinationPostalCode: String!): [Route!]!
+  optimizeRoute(input: RouteOptimizationInput!): RouteOptimizationResult!
+}
+
+type Mutation {
+  createRoute(input: CreateRouteInput!): Route!
+  setRouteStatus(id: ID!, status: RouteStatus!): Route!
+}
+
+type Route @key(fields: "id") {
+  id: ID!
+  name: String!
+  originWarehouseId: ID!
+  destinationPostalCode: String!
+  status: RouteStatus!
+  transportMode: TransportMode!
+  totalDistanceKm: Float!
+  estimatedDurationHours: Float!
+  costPerKg: Float!
+  maxWeightKg: Float!
+  maxVolumeM3: Float!
+  carrierIds: [ID!]!
+  restrictions: RouteRestrictions!
+  waypoints: [Waypoint!]!
+}
+
+type RouteRestrictions @shareable {
+  hazardousAllowed: Boolean!
+  temperatureControlled: Boolean!
+  maxItemValueUsd: Float
+  countries: [String!]!
+}
+
+type Waypoint {
+  sequence: Int!
+  location: String!
+  lat: Float
+  lng: Float
+  estimatedArrival: String
+  type: WaypointType!
+}
+
+type RouteOptimizationResult {
+  recommendedRoute: Route!
+  alternatives: [Route!]!
+  estimatedCost: Float!
+  estimatedDeliveryDate: String!
+  carbonFootprintKg: Float!
+  reasoning: String!
+}
+
+enum RouteStatus   { ACTIVE INACTIVE MAINTENANCE }
+enum TransportMode { ROAD RAIL AIR SEA MULTIMODAL }
+enum WaypointType  { ORIGIN TRANSIT HUB DESTINATION }
+
+input RouteOptimizationInput {
+  originWarehouseId: ID!
+  destinationPostalCode: String!
+  destinationCountry: String!
+  weightKg: Float!
+  volumeM3: Float!
+  totalValueUsd: Float!
+  hasHazardous: Boolean!
+  requiresTemperatureControl: Boolean!
+  requiredDeliveryDate: String
+  priority: String!
+}
+
+input CreateRouteInput {
+  name: String!
+  originWarehouseId: ID!
+  destinationPostalCode: String!
+  transportMode: TransportMode!
+  totalDistanceKm: Float!
+  estimatedDurationHours: Float!
+  costPerKg: Float!
+  maxWeightKg: Float!
+  maxVolumeM3: Float!
+  carrierIds: [ID!]
+}

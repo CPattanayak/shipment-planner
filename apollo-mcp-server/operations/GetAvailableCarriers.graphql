@@ -1,0 +1,44 @@
+# Tool: get_available_carriers
+# Returns carriers that can handle the shipment (standard, non-hazardous).
+# hasHazardous and requiresTemperatureControl are hardcoded false for standard shipments.
+query GetAvailableCarriers(
+  $originPostalCode: String!
+  $destinationPostalCode: String!
+  $weightKg: Float!
+) {
+  availableCarriers(
+    input: {
+      originPostalCode: $originPostalCode
+      destinationPostalCode: $destinationPostalCode
+      weightKg: $weightKg
+      hasHazardous: false
+      requiresTemperatureControl: false
+      serviceLevel: "STANDARD"
+    }
+  ) {
+    id
+    name
+    code
+    active
+    supportedModes
+    serviceAreas
+    capabilities {
+      maxWeightKg
+      maxVolumeM3
+      hazardousAllowed
+      temperatureControlled
+      expressAvailable
+      overnightAvailable
+      sameDayAvailable
+      trackingAvailable
+    }
+    performance {
+      onTimeDeliveryRate
+      averageDelayHours
+      damageRate
+      customerSatisfaction
+      totalShipments
+    }
+    contactEmail
+  }
+}

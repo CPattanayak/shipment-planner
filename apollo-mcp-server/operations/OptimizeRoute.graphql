@@ -1,0 +1,39 @@
+# Tool: optimize_route
+# Returns the best route for a shipment.
+# hasHazardous, requiresTemperatureControl, totalValueUsd are hardcoded safe defaults.
+query OptimizeRoute(
+  $originWarehouseId: ID!
+  $destinationPostalCode: String!
+  $destinationCountry: String!
+  $weightKg: Float!
+  $volumeM3: Float!
+  $requiredDeliveryDate: String
+) {
+  optimizeRoute(
+    input: {
+      originWarehouseId: $originWarehouseId
+      destinationPostalCode: $destinationPostalCode
+      destinationCountry: $destinationCountry
+      weightKg: $weightKg
+      volumeM3: $volumeM3
+      totalValueUsd: 500.0
+      hasHazardous: false
+      requiresTemperatureControl: false
+      requiredDeliveryDate: $requiredDeliveryDate
+      priority: "STANDARD"
+    }
+  ) {
+    recommendedRoute {
+      id
+      name
+      transportMode
+      totalDistanceKm
+      estimatedDurationHours
+      costPerKg
+    }
+    estimatedCost
+    estimatedDeliveryDate
+    carbonFootprintKg
+    reasoning
+  }
+}

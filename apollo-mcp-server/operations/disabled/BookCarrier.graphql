@@ -1,0 +1,25 @@
+# Tool: book_carrier
+# Confirms a carrier booking for a shipment and receives a tracking number.
+mutation BookCarrier(
+  $carrierId: ID!
+  $shipmentId: ID!
+  $serviceLevel: String!
+  $requestedPickupDate: String!
+) {
+  bookCarrier(
+    input: {
+      carrierId: $carrierId
+      shipmentId: $shipmentId
+      serviceLevel: $serviceLevel
+      requestedPickupDate: $requestedPickupDate
+    }
+  ) {
+    bookingId
+    carrierId
+    shipmentId
+    confirmedAt
+    pickupWindow
+    estimatedDelivery
+    trackingNumber
+  }
+}

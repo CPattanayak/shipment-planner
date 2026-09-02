@@ -1,0 +1,63 @@
+spring:
+  application:
+    name: shipment-service
+
+  # ── JPA ──────────────────────────────────────────────────────────────────
+  jpa:
+    hibernate:
+      ddl-auto: validate          # Flyway owns DDL; Hibernate only validates
+    properties:
+      hibernate:
+        default_schema: shipment
+        format_sql: true
+    show-sql: false
+    open-in-view: false
+
+  # ── Flyway ───────────────────────────────────────────────────────────────
+  flyway:
+    enabled: true
+    default-schema: shipment
+    schemas: shipment
+    locations: classpath:db/migration
+    baseline-on-migrate: true
+
+  # ── GraphQL ──────────────────────────────────────────────────────────────
+  graphql:
+    graphiql:
+      enabled: true
+    path: /graphql
+    schema:
+      locations: classpath:graphql/
+
+server:
+  port: 8081
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics
+
+---
+# ── Local profile (runs against Docker postgres) ─────────────────────────────
+spring:
+  config:
+    activate:
+      on-profile: local
+  datasource:
+    url: jdbc:postgresql://localhost:5432/shipment_planner?currentSchema=shipment
+    username: shipment_svc
+    password: shipment_pass
+    driver-class-name: org.postgresql.Driver
+
+---
+# ── Docker profile (container → container networking) ────────────────────────
+spring:
+  config:
+    activate:
+      on-profile: docker
+  datasource:
+    url: jdbc:postgresql://postgres:5432/shipment_planner?currentSchema=shipment
+    username: shipment_svc
+    password: shipment_pass
+    driver-class-name: org.postgresql.Driver
