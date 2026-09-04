@@ -1,0 +1,203 @@
+version: "3.9"
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Shipment Planner – Docker Compose
+#  Services:
+#    postgres         – single DB, 4 schemas (shipment / route / carrier / warehouse)
+#    shipment-service – Spring Boot  :8081  GraphQL subgraph
+#    route-service    – Spring Boot  :8082  GraphQL subgraph
+#    carrier-service  – Spring Boot  :8083  GraphQL subgraph
+#    warehouse-service– Spring Boot  :8084  GraphQL subgraph
+#    apollo-router    – Federation router :4000
+#    apollo-mcp-server– Official Apollo MCP Server :8090→8000
+#    fastapi-gateway  – LangGraph + OpenRouter FastAPI :8000
+#    react-ui         – Vite React + Apollo Client (nginx) :3000
+# ─────────────────────────────────────────────────────────────────────────────
+
+x-spring-defaults: &spring-defaults
+  restart: unless-stopped
+  networks: [shipment-net]
+  depends_on:
+    postgres:
+      condition: service_healthy
+
+services:
+
+  # ── PostgreSQL ──────────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    container_name: sp-postgres
+    restart: unless-stopped
+    networks: [shipment-net]
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_DB: shipment_planner
+      POSTGRES_USER: sp_admin
+      POSTGRES_PASSWORD: ${POSTGRES_ADMIN_PASSWORD:-sp_admin_pass}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./docker/postgres-init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sp_admin -d shipment_planner"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── Shipment Service ────────────────────────────────────────────────────────
+  shipment-service:
+    <<: *spring-defaults
+    build:
+      context: ./domain-services/shipment-service
+      dockerfile: Dockerfile
+    container_name: sp-shipment
+    ports:
+      - "8081:8081"
+    environment:
+      SPRING_PROFILES_ACTIVE: docker
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/shipment_planner?currentSchema=shipment
+      SPRING_DATASOURCE_USERNAME: shipment_svc
+      SPRING_DATASOURCE_PASSWORD: shipment_pass
+      SPRING_FLYWAY_DEFAULT_SCHEMA: shipment
+      SERVER_PORT: "8081"
+
+  # ── Route Service ───────────────────────────────────────────────────────────
+  route-service:
+    <<: *spring-defaults
+    build:
+      context: ./domain-services/route-service
+      dockerfile: Dockerfile
+    container_name: sp-route
+    ports:
+      - "8082:8082"
+    environment:
+      SPRING_PROFILES_ACTIVE: docker
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/shipment_planner?currentSchema=route
+      SPRING_DATASOURCE_USERNAME: route_svc
+      SPRING_DATASOURCE_PASSWORD: route_pass
+      SPRING_FLYWAY_DEFAULT_SCHEMA: route
+      SERVER_PORT: "8082"
+
+  # ── Carrier Service ─────────────────────────────────────────────────────────
+  carrier-service:
+    <<: *spring-defaults
+    build:
+      context: ./domain-services/carrier-service
+      dockerfile: Dockerfile
+    container_name: sp-carrier
+    ports:
+      - "8083:8083"
+    environment:
+      SPRING_PROFILES_ACTIVE: docker
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/shipment_planner?currentSchema=carrier
+      SPRING_DATASOURCE_USERNAME: carrier_svc
+      SPRING_DATASOURCE_PASSWORD: carrier_pass
+      SPRING_FLYWAY_DEFAULT_SCHEMA: carrier
+      SERVER_PORT: "8083"
+
+  # ── Warehouse Service ───────────────────────────────────────────────────────
+  warehouse-service:
+    <<: *spring-defaults
+    build:
+      context: ./domain-services/warehouse-service
+      dockerfile: Dockerfile
+    container_name: sp-warehouse
+    ports:
+      - "8084:8084"
+    environment:
+      SPRING_PROFILES_ACTIVE: docker
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/shipment_planner?currentSchema=warehouse
+      SPRING_DATASOURCE_USERNAME: warehouse_svc
+      SPRING_DATASOURCE_PASSWORD: warehouse_pass
+      SPRING_FLYWAY_DEFAULT_SCHEMA: warehouse
+      SERVER_PORT: "8084"
+
+  # ── Apollo Router (Federation) ──────────────────────────────────────────────
+  apollo-router:
+    image: ghcr.io/apollographql/router:v1.47.0
+    container_name: sp-router
+    restart: unless-stopped
+    networks: [shipment-net]
+    ports:
+      - "4000:4000"
+    volumes:
+      - ./apollo-federation/router.yaml:/dist/config/router.yaml:ro
+      - ./apollo-federation/supergraph.graphql:/dist/schema/supergraph.graphql:ro
+    command: >
+      --config /dist/config/router.yaml
+      --supergraph /dist/schema/supergraph.graphql
+    depends_on:
+      - shipment-service
+      - route-service
+      - carrier-service
+      - warehouse-service
+
+  # ── Apollo MCP Server ───────────────────────────────────────────────────────
+  # Official image: ghcr.io/apollographql/apollo-mcp-server
+  # Each .graphql file in apollo-mcp-server/operations/ becomes one MCP tool.
+  # Hot-reload: edit/add files → tools update without restarting the container.
+  apollo-mcp-server:
+    image: ghcr.io/apollographql/apollo-mcp-server:latest
+    container_name: sp-mcp
+    restart: unless-stopped
+    networks: [shipment-net]
+    ports:
+      - "8090:8000"   # MCP streamable-HTTP on 8000 inside, mapped to 8090 on host
+    volumes:
+      # config.yaml tells the server where to find operations and the schema
+      - ./apollo-mcp-server/config.yaml:/config.yaml:ro
+      # named .graphql files → each becomes one MCP tool (hot-reloaded)
+      - ./apollo-mcp-server/operations:/mcp-operations:ro
+      # composed supergraph schema produced by Rover
+      - ./apollo-federation/supergraph.graphql:/supergraph/supergraph.graphql:ro
+    command: ["--config", "/config.yaml"]
+    depends_on:
+      - apollo-router
+
+  # ── FastAPI Gateway (LangGraph + OpenRouter) ────────────────────────────────
+  fastapi-gateway:
+    build:
+      context: ./fastapi-gateway
+      dockerfile: Dockerfile
+    container_name: sp-gateway
+    restart: unless-stopped
+    networks: [shipment-net]
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    environment:
+      # Points at the official Apollo MCP Server (streamable HTTP)
+      MCP_SERVER_URL: http://apollo-mcp-server:8000
+      GRAPHQL_ENDPOINT: http://apollo-router:4000/graphql
+      # OPENROUTER_API_KEY is read from .env
+      OPENROUTER_BASE_URL: https://openrouter.ai/api/v1
+      # Default model – override in .env to use any OpenRouter-supported model
+      # openai/gpt-4o-mini → fast & cheap   openai/gpt-4o → stronger
+      # anthropic/claude-3.5-sonnet → best quality
+      OPENROUTER_MODEL: ${OPENROUTER_MODEL:-openai/gpt-4o-mini}
+    depends_on:
+      - apollo-mcp-server
+
+  # ── React UI ────────────────────────────────────────────────────────────────
+  # Nginx serves the built React app on :3000.
+  # /api/* is proxied to fastapi-gateway:8000 (avoids CORS, enables SSE).
+  # Apollo Client points at /api/v1/graphql → FastAPI → Apollo Router.
+  react-ui:
+    build:
+      context: ./react-ui
+      dockerfile: Dockerfile
+    container_name: sp-ui
+    restart: unless-stopped
+    networks: [shipment-net]
+    ports:
+      - "3000:80"
+    depends_on:
+      - fastapi-gateway
+
+volumes:
+  postgres-data:
+
+networks:
+  shipment-net:
+    driver: bridge

@@ -8,6 +8,57 @@ const V2     = '/api/v2';
 const V3     = '/api/v3';
 const HYBRID = '/api/hybrid';
 
+/**
+ * Extract a clean, human-readable message from a failed response body.
+ * Handles three layers of nesting that can arrive from FastAPI + GraphQL:
+ *   1. {"errors":[{"message":"..."}]}          ← direct GraphQL body
+ *   2. {"detail":"{\"errors\":[{\"message\":\"...\"}]}"}  ← FastAPI wrapping GraphQL JSON string
+ *   3. {"detail":"plain message"}               ← FastAPI plain error
+ */
+function extractErrorMessage(status, statusText, text) {
+  try {
+    const outer = JSON.parse(text);
+
+    // Layer 1: top-level GraphQL errors array
+    if (Array.isArray(outer.errors) && outer.errors.length > 0) {
+      const msg = outer.errors[0]?.message;
+      if (msg) return msg;
+    }
+
+    // Layer 2a: FastAPI Pydantic validation — detail is an array of field errors
+    if (Array.isArray(outer.detail) && outer.detail.length > 0) {
+      return outer.detail.map(e => {
+        const field = Array.isArray(e.loc) ? e.loc[e.loc.length - 1] : 'field';
+        return `"${field}": ${e.msg}`;
+      }).join('; ');
+    }
+
+    // Layer 2b: FastAPI {"detail": "..."} — detail may itself be a JSON string
+    if (typeof outer.detail === 'string') {
+      if (outer.detail === 'Not Found') return 'Service not found — check that all containers are running.';
+      try {
+        const inner = JSON.parse(outer.detail);
+        if (Array.isArray(inner.errors) && inner.errors.length > 0) {
+          const msg = inner.errors[0]?.message;
+          if (msg) return msg;
+        }
+        if (inner.message) return inner.message;
+      } catch {
+        // detail is a plain string — use it directly
+        return outer.detail;
+      }
+    }
+  } catch {
+    // Not JSON at all — fall back to raw text (trimmed)
+  }
+  // httpx exception: "Client error '4xx ...' for url 'http://internal-host/...'"
+  // Strip the internal URL — it's meaningless to the end user.
+  const httpxMatch = text.match(/Client error '(\d{3} [^']+)' for url/);
+  if (httpxMatch) return `GraphQL service returned ${httpxMatch[1]} — check the backend logs.`;
+
+  return text.trim() || `${status} ${statusText}`;
+}
+
 async function post(url, body) {
   const res = await fetch(url, {
     method: 'POST',
@@ -16,7 +67,7 @@ async function post(url, body) {
   });
   if (!res.ok) {
     const text = await res.text();
-    throw new Error(`${res.status} ${res.statusText}: ${text}`);
+    throw new Error(extractErrorMessage(res.status, res.statusText, text));
   }
   return res.json();
 }

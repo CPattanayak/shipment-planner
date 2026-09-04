@@ -1,5 +1,7 @@
 package com.shipmentplanner.service;
 
+import com.shipmentplanner.exception.BusinessException;
+import com.shipmentplanner.exception.BusinessException.ErrorType;
 import com.shipmentplanner.model.*;
 import com.shipmentplanner.repository.ShipmentRepository;
 import lombok.RequiredArgsConstructor;
@@ -119,7 +121,7 @@ public class ShipmentService {
 
     public Shipment getById(String id) {
         return repo.findById(id)
-            .orElseThrow(() -> new RuntimeException("Shipment not found: " + id));
+            .orElseThrow(() -> new BusinessException(ErrorType.NOT_FOUND, "Shipment not found: " + id));
     }
 
     public List<Shipment> list(ShipmentStatus status) {

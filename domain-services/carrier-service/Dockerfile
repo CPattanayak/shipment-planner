@@ -5,13 +5,18 @@ WORKDIR /workspace
 COPY pom.xml parent-pom.xml
 COPY domain-services/carrier-service/pom.xml pom.xml
 
+# Pre-fetch dependencies. Best-effort — suppress only this step's failures.
 RUN --mount=type=cache,target=/root/.m2 \
-    mvn -f parent-pom.xml install -N -q 2>/dev/null || true && \
-    mvn dependency:go-offline -q 2>/dev/null || true
+    mvn dependency:go-offline -q || true
 
 COPY domain-services/carrier-service/src src
 
+# Build: clear only the cached negative entry for the parent POM (stale from
+# a previous failed resolution attempt), install it from the local file, then
+# package. Targeted rm avoids the network storm that -U would cause.
 RUN --mount=type=cache,target=/root/.m2 \
+    rm -rf /root/.m2/repository/com/shipmentplanner/shipment-planner-parent && \
+    mvn -f parent-pom.xml install -N -q && \
     mvn package -DskipTests -q
 
 # ── Runtime stage ─────────────────────────────────────────────────────────────

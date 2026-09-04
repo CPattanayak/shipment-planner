@@ -1,0 +1,25 @@
+# Tool: get_warehouses
+# Lists all warehouses with capacity and utilisation information.
+query GetWarehouses($activeOnly: Boolean = true) {
+  warehouses(activeOnly: $activeOnly) {
+    id
+    code
+    name
+    capacityM3
+    usedM3
+    availableM3
+    utilizationPct
+    active
+    capabilities
+    contactEmail
+    address {
+      street
+      city
+      state
+      country
+      postalCode
+      lat
+      lng
+    }
+  }
+}

@@ -1,5 +1,7 @@
 package com.shipmentplanner.service;
 
+import com.shipmentplanner.exception.BusinessException;
+import com.shipmentplanner.exception.BusinessException.ErrorType;
 import com.shipmentplanner.model.Carrier;
 import com.shipmentplanner.model.CarrierBooking;
 import com.shipmentplanner.repository.CarrierBookingRepository;
@@ -20,9 +22,15 @@ public class CarrierService {
     private final CarrierRepository carrierRepository;
     private final CarrierBookingRepository carrierBookingRepository;
 
-    public Carrier getById(String id) {
-        return carrierRepository.findById(id)
-                .orElseThrow(() -> new RuntimeException("Carrier not found: " + id));
+    /**
+     * Resolve a carrier by its primary key ({@code id}) or, as a fallback, by its
+     * short {@code code} (e.g. {@code "SRC"}).  Accepting both forms keeps the API
+     * tolerant of callers that use the code field instead of the UUID id.
+     */
+    public Carrier getById(String idOrCode) {
+        return carrierRepository.findById(idOrCode)
+                .or(() -> carrierRepository.findByCode(idOrCode))
+                .orElseThrow(() -> new BusinessException(ErrorType.NOT_FOUND, "Carrier not found: " + idOrCode));
     }
 
     public List<Carrier> listAll(Boolean activeOnly) {

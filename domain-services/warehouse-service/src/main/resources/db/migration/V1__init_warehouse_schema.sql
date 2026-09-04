@@ -45,7 +45,9 @@ CREATE INDEX IF NOT EXISTS idx_dock_shipment            ON dock_schedules(shipme
 -- Seed one warehouse
 INSERT INTO warehouses (id, code, name, city, state, country, postal_code, lat, lng, capacity_m3, active)
 VALUES
-  ('wh-001', 'CHI-01', 'Chicago Central', 'Chicago', 'IL', 'US', '60601', 41.8781, -87.6298, 50000, TRUE),
-  ('wh-002', 'NYC-01', 'New York East',   'New York', 'NY', 'US', '10001', 40.7128, -74.0060, 35000, TRUE),
-  ('wh-003', 'LAX-01', 'Los Angeles West','Los Angeles','CA','US', '90001', 34.0522,-118.2437, 45000, TRUE)
+  ('wh-001', 'CHI-01', 'Chicago Central',  'Chicago',     'IL', 'US', '60601', 41.8781, -87.6298, 50000, TRUE),
+  ('wh-002', 'NYC-01', 'New York East',    'New York',    'NY', 'US', '10001', 40.7128, -74.0060, 35000, TRUE),
+  ('wh-003', 'LAX-01', 'Los Angeles West', 'Los Angeles', 'CA', 'US', '90001', 34.0522,-118.2437, 45000, TRUE),
+  -- wh-004 intentionally has NO routes seeded → use it to test "no routes available" error path
+  ('wh-004', 'TEST-01','Test (No Routes)',  'Test City',   'TX', 'US', '99999', 31.0000, -97.0000,  1000, TRUE)
 ON CONFLICT (id) DO NOTHING;

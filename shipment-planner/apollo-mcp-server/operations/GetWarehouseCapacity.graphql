@@ -1,0 +1,12 @@
+# Tool: get_warehouse_capacity
+# Returns a detailed capacity summary for a specific warehouse.
+query GetWarehouseCapacity($id: ID!) {
+  warehouseCapacity(id: $id) {
+    warehouseId
+    totalM3
+    usedM3
+    availableM3
+    utilizationPct
+    pendingShipments
+  }
+}

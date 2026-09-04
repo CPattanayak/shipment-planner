@@ -1,0 +1,74 @@
+extend schema
+  @link(url: "https://specs.apollo.dev/federation/v2.3",
+        import: ["@key", "@shareable"])
+
+type Query {
+  warehouse(id: ID!): Warehouse
+  warehouses(activeOnly: Boolean = true): [Warehouse!]!
+  availableDockSlots(warehouseId: ID!, date: String!): [DockSlot!]!
+  warehouseCapacity(id: ID!): CapacitySummary!
+}
+
+type Mutation {
+  bookDockSlot(input: DockBookingInput!): DockSlot!
+  releaseDockSlot(slotId: ID!): DockSlot!
+  updateCapacity(warehouseId: ID!, usedM3: Float!): Warehouse!
+}
+
+type Warehouse @key(fields: "id") {
+  id: ID!
+  code: String!
+  name: String!
+  address: WarehouseAddress!
+  capacityM3: Float!
+  usedM3: Float!
+  availableM3: Float!
+  utilizationPct: Float!
+  active: Boolean!
+  capabilities: [String!]!
+  contactEmail: String
+}
+
+type WarehouseAddress @shareable {
+  street: String
+  city: String!
+  state: String
+  country: String!
+  postalCode: String!
+  lat: Float
+  lng: Float
+}
+
+type DockSlot {
+  id: ID!
+  warehouseId: ID!
+  dockNumber: Int!
+  date: String!
+  startTime: String!
+  endTime: String!
+  shipmentId: ID
+  type: DockSlotType!
+  status: DockSlotStatus!
+}
+
+type CapacitySummary {
+  warehouseId: ID!
+  totalM3: Float!
+  usedM3: Float!
+  availableM3: Float!
+  utilizationPct: Float!
+  pendingShipments: Int!
+}
+
+enum DockSlotType   { PICKUP DELIVERY }
+enum DockSlotStatus { AVAILABLE BOOKED COMPLETED CANCELLED }
+
+input DockBookingInput {
+  warehouseId: ID!
+  dockNumber: Int!
+  date: String!
+  startTime: String!
+  endTime: String!
+  shipmentId: ID!
+  type: DockSlotType!
+}

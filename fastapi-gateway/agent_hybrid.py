@@ -3,30 +3,32 @@ Shipment Planning — Hybrid (LangGraph StateGraph + explicit MCP tool nodes)
 
 Architecture
 ────────────
-  Two dedicated MCP nodes replace the single Apollo-supergraph fan-out of V3.
-  Each node creates its own MultiServerMCPClient, calls tools by name, and
-  uses asyncio.gather() for the operations that are independent of each other.
+  One dedicated pipeline node replaces the two original MCP nodes.
+  It delegates all MCP reads to the shared mcp_pipeline framework using
+  run_parallel_planning_pipeline():
 
-  mcp_node_1   Round 1: asyncio.gather(get_warehouse_capacity, optimize_route)
-               Round 2: get_available_carriers   (needs origin postal from R1)
+    Round 1 (parallel) — GetWarehouseCapacity + OptimizeRoute  (asyncio.gather)
+    Round 2            — GetAvailableCarriers  (needs origin_postal from R1)
+    Round 3            — GetCarrierQuote        (needs best_carrier from R2)
 
-  mcp_node_2   get_carrier_quote                 (tool-chains from best carrier)
+  Each step is a self-contained MCPToolStep subclass (see mcp_pipeline.py)
+  that declares its inputs, validates its output, and writes to the shared
+  ToolContext.  Adding a new read tool = one new subclass; nothing else changes.
 
-  plan_gate    HLT interrupt – Gate 1 (review plan; nothing written yet)
-
-  create_ship  CreateShipment + BookCarrier  ← direct GraphQL (MCP is read-only)
-
-  dock_gate    HLT interrupt – Gate 2 (review dock slot)
-
-  book_dock    BookDockSlot                  ← direct GraphQL
+  pipeline_node   Runs all four read steps via run_planning_pipeline()
+  plan_gate       HLT interrupt – Gate 1 (review plan; nothing written yet)
+  create_ship     CreateShipment + BookCarrier  ← direct GraphQL (MCP is read-only)
+  dock_gate       HLT interrupt – Gate 2 (review dock slot)
+  book_dock       BookDockSlot                  ← direct GraphQL
 
 vs V3
 ─────
-  V3  sends one combined GraphQL document; Apollo Router's query planner fans
-      out warehouse + route subgraphs in parallel on the server side.
+  V3  sends one combined GraphQL document; Apollo Router fans out subgraphs
+      server-side.
 
-  Hybrid explicitly names each MCP tool, runs asyncio.gather() in Python, and
-  chains node outputs as typed state — parallelism is visible in the code.
+  Hybrid explicitly names each MCP tool via the pipeline framework,
+  giving full visibility into each tool call (inputs → outputs → errors)
+  while the graph controls the HITL gates and mutation nodes.
 
 Imports
 ───────
@@ -34,13 +36,11 @@ Imports
                 ("2024-11-05") that Apollo MCP Server requires.
   agent_v3    — _gql / _check helpers and the three mutation strings are reused
                 as-is; no boilerplate is duplicated.
+  mcp_pipeline — ToolContext + run_planning_pipeline (the shared read framework).
 """
 
-import asyncio
-import json
 import logging
 import uuid
-from datetime import datetime, timezone
 from typing import Optional
 from typing_extensions import TypedDict
 
@@ -59,6 +59,7 @@ from agent_v3 import (
     _M_BOOK_DOCK_SLOT,
 )
 from config import MCP_SERVER_URL
+from mcp_pipeline import ToolContext, run_parallel_planning_pipeline
 
 log = logging.getLogger(__name__)
 
@@ -76,30 +77,13 @@ async def _get_tools() -> dict:
     return tool_map
 
 
-def _tool(t: dict, name: str):
-    """Look up a tool by name; raise a clear error listing available tools."""
-    if name not in t:
-        available = list(t.keys())
-        raise KeyError(f"MCP tool '{name}' not found. Available: {available}")
-
-
-def _parse(raw) -> dict:
-    """Normalise an MCP tool result (str, list-of-blocks, or dict) → dict."""
-    if isinstance(raw, str):
-        return json.loads(raw)
-    if isinstance(raw, list):
-        text = " ".join(b.get("text", "") for b in raw if isinstance(b, dict))
-        return json.loads(text)
-    return raw if isinstance(raw, dict) else {}
-
-
 # ── State ─────────────────────────────────────────────────────────────────────
 
 class HState(TypedDict):
     # input
     request: dict
 
-    # phase 1 — plan data
+    # phase 1 — plan data (written by pipeline_node)
     warehouse: dict
     capacity: dict
     route: dict
@@ -125,17 +109,22 @@ class HState(TypedDict):
     error: Optional[str]
 
 
-# ── MCP Node 1 ────────────────────────────────────────────────────────────────
+# ── Pipeline node ─────────────────────────────────────────────────────────────
 
-async def mcp_node_1(state: HState) -> dict:
+async def pipeline_node(state: HState) -> dict:
     """
-    Round 1  asyncio.gather(get_warehouse_capacity, optimize_route)
-             Both need only warehouseId — they are fully independent.
-    Round 2  get_available_carriers
-             Needs origin postal code resolved in Round 1.
+    Runs all four MCP read steps through the shared pipeline framework with
+    Round 1 parallelised via asyncio.gather():
+
+      Round 1 (parallel) — GetWarehouseCapacity + OptimizeRoute
+      Round 2            — GetAvailableCarriers  (needs origin_postal from R1)
+      Round 3            — GetCarrierQuote        (needs best_carrier from R2)
+
+    Each step logs → / ✓ / ✗ and writes its extracted values into the shared
+    ToolContext.  On the first failure the pipeline stops and returns an error.
     """
-    req  = state["request"]
-    dst  = req["destinationAddress"]
+    req   = state["request"]
+    dst   = req["destinationAddress"]
     items = req.get("items", [])
 
     weight_kg = sum(float(i.get("weight", 0)) * int(i.get("quantity", 1)) for i in items) or 100.0
@@ -143,99 +132,36 @@ async def mcp_node_1(state: HState) -> dict:
     priority  = req.get("priority", "STANDARD")
     service_level = "EXPRESS" if priority in ("EXPRESS", "OVERNIGHT", "SAME_DAY") else "STANDARD"
 
-    log.info("hybrid mcp_node_1: wh=%s dest=%s %.1fkg", req["originWarehouseId"], dst["postalCode"], weight_kg)
+    log.info("hybrid pipeline_node: wh=%s dest=%s %.1fkg", req["originWarehouseId"], dst["postalCode"], weight_kg)
 
-    t = await _get_tools()
-
-    # ── Round 1: parallel ──────────────────────────────────────────────────
-    cap_raw, route_raw = await asyncio.gather(
-        t["GetWarehouseCapacity"].ainvoke({"id": req["originWarehouseId"]}),
-        t["OptimizeRoute"].ainvoke({
-            "originWarehouseId":      req["originWarehouseId"],
-            "destinationPostalCode":  dst["postalCode"],
-            "destinationCountry":     dst.get("country", "US"),
-            "weightKg":               weight_kg,
-            "volumeM3":               volume_m3,
-        }),
-    )
-
-    cap_data   = _parse(cap_raw).get("data", {})
-    warehouse  = cap_data.get("warehouse")
-    if not warehouse:
-        return {"status": "error", "error": f"Warehouse '{req['originWarehouseId']}' not found."}
-
-    capacity   = cap_data.get("warehouseCapacity", {})
-    origin_postal = warehouse.get("address", {}).get("postalCode", "")
-    if not origin_postal:
-        return {"status": "error", "error": "Warehouse address / postal code missing."}
-
-    opt_data = _parse(route_raw).get("data", {})
-    route    = opt_data.get("optimizeRoute")
-    if not route:
-        return {"status": "error", "error": f"No route found from '{req['originWarehouseId']}' to {dst['postalCode']}."}
-
-    log.info("hybrid mcp_node_1: origin_postal=%s route_ok", origin_postal)
-
-    # ── Round 2: carriers (needs postal from Round 1) ──────────────────────
-    carr_raw = await t["GetAvailableCarriers"].ainvoke({
-        "originPostalCode":      origin_postal,
-        "destinationPostalCode": dst["postalCode"],
-        "weightKg":              weight_kg,
+    ctx = ToolContext({
+        "request":       req,
+        "weight_kg":     weight_kg,
+        "volume_m3":     volume_m3,
+        "service_level": service_level,
     })
 
-    carriers = _parse(carr_raw).get("data", {}).get("availableCarriers", [])
-    if not carriers:
-        return {"status": "error", "error": f"No carriers available from {origin_postal} to {dst['postalCode']}."}
+    tool_map = await _get_tools()
+    ok, err  = await run_parallel_planning_pipeline(ctx, tool_map)
 
-    best = max(carriers, key=lambda c: c.get("performance", {}).get("onTimeDeliveryRate", 0))
-    log.info("hybrid mcp_node_1: best_carrier=%s", best.get("name"))
-
-    raw_date    = route.get("estimatedDeliveryDate", "")
-    delivery_dt = raw_date[:10] if raw_date else datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    if not ok:
+        return {"status": "error", "error": err}
 
     return {
-        "warehouse":    warehouse,
-        "capacity":     capacity,
-        "route":        route,
-        "carriers":     carriers,
-        "best_carrier": best,
-        "origin_postal": origin_postal,
-        "delivery_date": delivery_dt,
-        "weight_kg":    weight_kg,
-        "volume_m3":    volume_m3,
+        "warehouse":     ctx["warehouse"],
+        "capacity":      ctx["capacity"],
+        "route":         ctx["route"],
+        "carriers":      ctx["carriers"],
+        "best_carrier":  ctx["best_carrier"],
+        "quote":         ctx["quote"],
+        "origin_postal": ctx["origin_postal"],
+        "delivery_date": ctx["delivery_date"],
+        "weight_kg":     weight_kg,
+        "volume_m3":     volume_m3,
         "service_level": service_level,
-        "status":       "reads_done",
-        "error":        None,
+        "status":        "reads_done",
+        "error":         None,
     }
-
-
-# ── MCP Node 2 ────────────────────────────────────────────────────────────────
-
-async def mcp_node_2(state: HState) -> dict:
-    """
-    Tool-chains from mcp_node_1:
-      best_carrier.id + origin_postal + dest postal + weight/volume → carrier quote.
-    """
-    req = state["request"]
-
-    log.info("hybrid mcp_node_2: quote for carrier=%s", state["best_carrier"].get("id"))
-
-    t = await _get_tools()
-    q_raw = await t["GetCarrierQuote"].ainvoke({
-        "carrierId":             state["best_carrier"]["id"],
-        "originPostalCode":      state["origin_postal"],
-        "destinationPostalCode": req["destinationAddress"]["postalCode"],
-        "weightKg":              state["weight_kg"],
-        "volumeM3":              state["volume_m3"],
-        "serviceLevel":          state.get("service_level", "STANDARD"),
-    })
-
-    quote = _parse(q_raw).get("data", {}).get("carrierQuote")
-    if not quote:
-        return {"status": "error", "error": "Carrier quote unavailable."}
-
-    log.info("hybrid mcp_node_2: total_cost=%s transit=%s", quote.get("totalCost"), quote.get("transitDays"))
-    return {"quote": quote, "status": "quoted", "error": None}
 
 
 # ── Gate 1: plan review (HLT interrupt) ───────────────────────────────────────
@@ -369,11 +295,7 @@ async def book_dock(state: HState) -> dict:
 
 # ── Conditional edges ─────────────────────────────────────────────────────────
 
-def _after_mcp_node_1(state: HState) -> str:
-    return END if state.get("error") else "mcp_node_2"
-
-
-def _after_mcp_node_2(state: HState) -> str:
+def _after_pipeline_node(state: HState) -> str:
     return END if state.get("error") else "plan_gate"
 
 
@@ -389,18 +311,16 @@ _checkpointer = MemorySaver()
 def _build_graph():
     g = StateGraph(HState)
 
-    g.add_node("mcp_node_1",      mcp_node_1)
-    g.add_node("mcp_node_2",      mcp_node_2)
-    g.add_node("plan_gate",       plan_gate)
-    g.add_node("create_shipment", create_shipment)
-    g.add_node("dock_gate",       dock_gate)
-    g.add_node("book_dock",       book_dock)
+    g.add_node("pipeline_node",    pipeline_node)
+    g.add_node("plan_gate",        plan_gate)
+    g.add_node("create_shipment",  create_shipment)
+    g.add_node("dock_gate",        dock_gate)
+    g.add_node("book_dock",        book_dock)
 
-    g.add_edge(START, "mcp_node_1")
-    g.add_conditional_edges("mcp_node_1",      _after_mcp_node_1,      {"mcp_node_2": "mcp_node_2", END: END})
-    g.add_conditional_edges("mcp_node_2",      _after_mcp_node_2,      {"plan_gate": "plan_gate",   END: END})
+    g.add_edge(START, "pipeline_node")
+    g.add_conditional_edges("pipeline_node",   _after_pipeline_node,   {"plan_gate": "plan_gate", END: END})
     # plan_gate / dock_gate return Command(goto=…) — no static edges needed
-    g.add_conditional_edges("create_shipment", _after_create_shipment, {"dock_gate": "dock_gate",   END: END})
+    g.add_conditional_edges("create_shipment", _after_create_shipment, {"dock_gate": "dock_gate", END: END})
     g.add_edge("book_dock", END)
 
     return g.compile(checkpointer=_checkpointer)
@@ -426,10 +346,10 @@ def _get_interrupt(snapshot) -> dict | None:
 
 async def start_plan(request: dict) -> dict:
     """
-    Phase 1 — mcp_node_1 + mcp_node_2.
+    Phase 1 — pipeline_node (all four MCP read steps via mcp_pipeline framework).
     Pauses at Gate 1 (plan_gate).
     Returns {"status": "needs_plan_confirmation", "threadId": …, "plan": {…}}
-         or {"status": "error", "error": "…"}
+         or {"status": "error", "threadId": …, "error": "…"}
     """
     thread_id = str(uuid.uuid4())
     config    = _config(thread_id)

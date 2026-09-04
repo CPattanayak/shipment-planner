@@ -25,7 +25,7 @@ const PRIORITIES = ['STANDARD', 'EXPRESS', 'OVERNIGHT', 'SAME_DAY'];
 const COUNTRIES  = ['US', 'CA', 'GB', 'DE', 'FR', 'AU', 'IN', 'SG', 'JP', 'MX'];
 const EMPTY_ITEM = {
   sku: '', description: '', quantity: 1,
-  weight: 0, volume: 0, value: 0,
+  weight: 0.1, volume: 0.1, value: 0,
   hazardous: false, temperatureControlled: false, fragile: false,
 };
 
@@ -361,11 +361,11 @@ function ItemRow({ item, idx, onChange, onRemove, canRemove }) {
         </div>
         <div>
           <label className="form-label">Weight (kg)</label>
-          <input className="form-input" type="number" min={0} step={0.1} value={item.weight} onChange={inp('weight', true)} />
+          <input className="form-input" type="number" min={0.001} step={0.1} value={item.weight} onChange={inp('weight', true)} />
         </div>
         <div>
           <label className="form-label">Volume (m³)</label>
-          <input className="form-input" type="number" min={0} step={0.001} value={item.volume} onChange={inp('volume', true)} />
+          <input className="form-input" type="number" min={0.001} step={0.001} value={item.volume} onChange={inp('volume', true)} />
         </div>
         <div>
           <label className="form-label">Value (USD)</label>
@@ -533,12 +533,37 @@ export default function PlanShipment() {
 
   /* Error */
   if (stage === 'error') return (
-    <div className="max-w-lg mx-auto px-4 py-8 space-y-4">
-      <div className="rounded-xl border border-red-200 dark:border-red-800 bg-red-50 dark:bg-red-900/20 px-5 py-4">
-        <p className="font-semibold text-red-900 dark:text-red-200 mb-1">Error</p>
-        <p className="text-sm text-red-700 dark:text-red-400">{error}</p>
+    <div className="max-w-xl mx-auto px-4 py-12">
+      <div className="rounded-2xl border border-red-200 dark:border-red-800 bg-red-50 dark:bg-red-900/20 p-6 space-y-4">
+        <div className="flex items-start gap-3">
+          <span className="text-2xl mt-0.5" aria-hidden="true">🚫</span>
+          <div>
+            <p className="text-base font-semibold text-red-800 dark:text-red-200">Planning failed</p>
+            <p className="text-xs text-red-500 dark:text-red-400 mt-0.5">No data was written to the database.</p>
+          </div>
+        </div>
+        <div className="rounded-lg bg-white dark:bg-red-950/40 border border-red-100 dark:border-red-800 px-4 py-3">
+          <p className="text-sm text-red-700 dark:text-red-300 leading-relaxed break-words">{error}</p>
+        </div>
+        {/"weight"|"volume"/i.test(error) && (
+          <p className="text-xs text-red-600 dark:text-red-400">💡 <strong>Hint:</strong> Item weight and volume must be greater than 0. Check each item row.</p>
+        )}
+        {/route|destination|postal/i.test(error) && (
+          <p className="text-xs text-red-600 dark:text-red-400">💡 <strong>Hint:</strong> No shipping route is configured for this destination. Ask an admin to add a route from the origin warehouse to this postal code.</p>
+        )}
+        {/carrier|quote/i.test(error) && (
+          <p className="text-xs text-red-600 dark:text-red-400">💡 <strong>Hint:</strong> No carriers are available for this route or weight. Try adjusting shipment details or check carrier configurations.</p>
+        )}
+        {/warehouse/i.test(error) && (
+          <p className="text-xs text-red-600 dark:text-red-400">💡 <strong>Hint:</strong> The selected warehouse could not be found. Please choose a valid origin warehouse.</p>
+        )}
+        {/service not found|containers/i.test(error) && (
+          <p className="text-xs text-red-600 dark:text-red-400">💡 <strong>Hint:</strong> One or more backend services are not responding. Run <code className="bg-red-100 dark:bg-red-900 px-1 rounded">docker compose up</code> and try again.</p>
+        )}
+        <div className="flex gap-3 pt-1">
+          <button onClick={handleReset} className="btn-primary">Try again</button>
+        </div>
       </div>
-      <button onClick={handleReset} className="btn-secondary">Start over</button>
     </div>
   );
 
