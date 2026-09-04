@@ -1,8 +1,10 @@
 /**
  * AgentComparison.jsx — Study-material landing page.
  *
- * Side-by-side comparison of V1 (LangGraph ReAct + MCP) and
- * V3 (LangGraph StateGraph + Apollo supergraph fan-out).
+ * Three-way comparison:
+ *   V1      LangGraph ReAct + MCP Tools + Per-mutation HITL
+ *   V3      LangGraph StateGraph + Apollo Supergraph fan-out + Two-gate HITL
+ *   Hybrid  LangGraph StateGraph + Explicit MCP Tool Nodes + asyncio.gather + Two-gate HITL
  */
 import { Link } from 'react-router-dom';
 
@@ -85,6 +87,47 @@ const V3 = {
   ],
 };
 
+const HYBRID = {
+  version: 'Hybrid',
+  title:   'MCP Tool Nodes',
+  color:   'teal',
+  emoji:   '🔀',
+  tagline: 'LangGraph StateGraph + Explicit MCP Nodes + asyncio.gather + Two-gate HITL',
+  path:    '/plan/hybrid',
+  cta:     'Try Hybrid →',
+  stack: [
+    { layer: 'Orchestration',  value: 'LangGraph StateGraph (explicit nodes + edges)'                },
+    { layer: 'Tool protocol',  value: 'MCP (Apollo MCP Server) called inside StateGraph nodes'       },
+    { layer: 'HITL strategy',  value: 'Two named interrupt() gates (plan + dock) — same as V3'       },
+    { layer: 'Data reads',     value: 'mcp_node_1: asyncio.gather(capacity, route) then carriers; mcp_node_2: quote' },
+    { layer: 'Data writes',    value: 'CreateShipment + BookCarrier + BookDockSlot via direct GraphQL' },
+    { layer: 'State storage',  value: 'MemorySaver checkpointer + thread_id'                         },
+    { layer: 'Confirmation',   value: 'PlanReviewDialog (Gate 1) + DockDialog (Gate 2)'              },
+    { layer: 'Gateway',        value: 'FastAPI /api/hybrid/plan + /api/hybrid/plan/confirm + /api/hybrid/dock/confirm' },
+  ],
+  flow: [
+    { step: 1, label: 'POST /api/hybrid/plan',         desc: 'mcp_node_1: asyncio.gather(get_warehouse_capacity, optimize_route); then get_available_carriers' },
+    { step: 2, label: 'mcp_node_2',                    desc: 'get_carrier_quote — tool-chains from best_carrier in mcp_node_1 state'                           },
+    { step: 3, label: 'Gate 1 interrupt()',             desc: 'plan_gate: pauses with full plan for human review. Nothing written yet.'                          },
+    { step: 4, label: 'POST /api/hybrid/plan/confirm', desc: 'Approved → CreateShipment + BookCarrier (direct GraphQL). Rejected → graph ends.'                 },
+    { step: 5, label: 'Gate 2 interrupt()',             desc: 'dock_gate: pauses with shipment + carrier info for dock-slot review.'                             },
+    { step: 6, label: 'POST /api/hybrid/dock/confirm', desc: 'Approved → BookDockSlot (direct GraphQL). Skipped → shipment stays active.'                       },
+  ],
+  pros: [
+    'Parallelism is explicit in Python code (asyncio.gather) — easy to read and teach',
+    'MCP tool names appear directly in the node code — no hidden query planning',
+    'Typed state flows node → node — tool chain is visible and testable',
+    'Same two-gate HITL UX as V3 — deterministic and auditable',
+    'Easy to add a new MCP tool: call it inside an existing node',
+  ],
+  cons: [
+    'More Python code than V3 (explicit gather vs one Apollo query)',
+    'MCP client opens a new connection per node — slight overhead',
+    'Less flexible than V1 — flow is still hardcoded in the graph',
+    'No Apollo Router query-plan caching (each tool call hits the subgraph directly)',
+  ],
+};
+
 /* ── Shared concepts ─────────────────────────────────────────────────────── */
 
 const CONCEPTS = [
@@ -118,7 +161,15 @@ const CONCEPTS = [
   },
   {
     term: 'TypedDict state',
-    desc: 'V3 uses a ShipmentState TypedDict as the LangGraph state schema. Each node receives the full state dict and returns only the keys it changes. LangGraph merges the returned dict back into the shared state.',
+    desc: 'V3 and Hybrid use a TypedDict as the LangGraph state schema. Each node receives the full state dict and returns only the keys it changes. LangGraph merges the returned dict back into the shared state.',
+  },
+  {
+    term: 'asyncio.gather()',
+    desc: 'Python coroutine that runs multiple awaitables concurrently in one event-loop tick. In Hybrid mcp_node_1, gather(get_warehouse_capacity, optimize_route) fires both MCP tool calls at the same time, halving Round 1 latency.',
+  },
+  {
+    term: 'Tool chain',
+    desc: 'In Hybrid, mcp_node_2 reads best_carrier from state that mcp_node_1 wrote. The output of one node becomes the input of the next via typed state — no LLM needed to decide which carrier to quote.',
   },
 ];
 
@@ -144,6 +195,16 @@ const COLOR = {
     con:     'text-red-500 dark:text-red-400',
     border:  'border-violet-200 dark:border-violet-700',
     title:   'text-violet-700 dark:text-violet-300',
+  },
+  teal: {
+    header:  'bg-teal-50 dark:bg-teal-900/20 border-teal-200 dark:border-teal-700',
+    badge:   'bg-teal-100 dark:bg-teal-800 text-teal-700 dark:text-teal-300',
+    cta:     'bg-teal-600 hover:bg-teal-700 text-white',
+    step:    'bg-teal-100 dark:bg-teal-800 text-teal-700 dark:text-teal-200',
+    pro:     'text-teal-600 dark:text-teal-400',
+    con:     'text-red-500 dark:text-red-400',
+    border:  'border-teal-200 dark:border-teal-700',
+    title:   'text-teal-700 dark:text-teal-300',
   },
 };
 
@@ -240,79 +301,104 @@ function VersionCard({ data }) {
 
 function ArchDiagram() {
   return (
-    <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+    <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
       {/* V1 */}
       <div className="bg-amber-50 dark:bg-amber-900/10 rounded-xl p-4 border border-amber-200 dark:border-amber-700 font-mono text-xs leading-relaxed text-gray-700 dark:text-gray-300">
         <p className="font-bold text-amber-700 dark:text-amber-300 mb-3">V1 — ReAct Loop</p>
-        <pre>{`UI ──► POST /api/v1/plan
-        │
-        ▼
-   FastAPI Gateway
-        │
-        ▼
- LangGraph ReAct Agent
-  ┌─────────────────────┐
-  │  think → act → obs  │
-  │  MCP tool calls:    │
-  │  • GetWarehouse     │
-  │  • OptimizeRoute    │
-  │  • GetCarriers      │◄── Apollo MCP Server
-  │  • GetQuote         │    (port 8090)
-  │  • CreateShipment ──┼──► interrupt()
-  │  • BookCarrier    ──┼──► interrupt()
-  │  • BookDockSlot   ──┼──► interrupt()
-  └─────────────────────┘
-        │
-        ▼
-   MemorySaver (thread_id)
-        │
-        ▼
-   UI confirm → POST /api/v1/plan/confirm
-   Command(resume=approved) → graph continues`}
+        <pre>{`POST /api/v1/plan
+  │
+  ▼
+LangGraph ReAct Agent
+┌──────────────────────┐
+│  think → act → obs   │
+│  MCP tool calls:     │
+│  • GetWarehouse      │◄─ MCP
+│  • OptimizeRoute     │   Server
+│  • GetCarriers       │   :8090
+│  • GetQuote          │
+│  • CreateShipment ───┼─► interrupt()
+│  • BookCarrier    ───┼─► interrupt()
+│  • BookDockSlot   ───┼─► interrupt()
+└──────────────────────┘
+  │
+  ▼
+MemorySaver(thread_id)
+  │
+  ▼
+POST /api/v1/plan/confirm
+Command(resume=approved)`}
         </pre>
       </div>
 
       {/* V3 */}
       <div className="bg-violet-50 dark:bg-violet-900/10 rounded-xl p-4 border border-violet-200 dark:border-violet-700 font-mono text-xs leading-relaxed text-gray-700 dark:text-gray-300">
         <p className="font-bold text-violet-700 dark:text-violet-300 mb-3">V3 — StateGraph</p>
-        <pre>{`UI ──► POST /api/v3/plan
-        │
-        ▼
-   FastAPI Gateway
-        │
-        ▼
- LangGraph StateGraph
-  START
-    │
-    ▼
-  plan_reads ──────────────► Apollo Router
-    │    one combined query    │  ├─ warehouse-svc (parallel)
-    │                          │  └─ route-svc     (parallel)
-    │    then carriers + quote │  └─ carrier-svc
-    │                          └─ quote-svc
-    ▼
-  _after_plan_reads
-    │ error? ──────────────► END
-    │ ok
-    ▼
-  plan_gate ──────────────► interrupt()  ← Gate 1
-    │
-    │ Command(resume=True/False)
-    │ POST /api/v3/plan/confirm
-    ▼
-  create_shipment (auto: CreateShipment + BookCarrier)
-    │ error? ──────────────► END
-    │ ok
-    ▼
-  dock_gate ──────────────► interrupt()  ← Gate 2
-    │
-    │ Command(resume=True/False)
-    │ POST /api/v3/dock/confirm
-    ▼
-  book_dock (BookDockSlot if approved)
-    │
-    ▼
-   END`}
+        <pre>{`POST /api/v3/plan
+  │
+  ▼
+LangGraph StateGraph
+START → plan_reads
+  │  one combined GQL doc
+  │  Apollo Router fans out:
+  │  ├─ warehouse-svc ║parallel
+  │  └─ route-svc     ║
+  │  then carriers → quote
+  ▼
+_after_plan_reads
+  │ error? ──► END
+  │ ok
+  ▼
+plan_gate ──► interrupt()
+             ← Gate 1
+  │ POST /api/v3/plan/confirm
+  │ Command(resume=True/False)
+  ▼
+create_shipment
+  CreateShipment + BookCarrier
+  │ error? ──► END
+  ▼
+dock_gate ──► interrupt()
+             ← Gate 2
+  │ POST /api/v3/dock/confirm
+  ▼
+book_dock → END`}
+        </pre>
+      </div>
+
+      {/* Hybrid */}
+      <div className="bg-teal-50 dark:bg-teal-900/10 rounded-xl p-4 border border-teal-200 dark:border-teal-700 font-mono text-xs leading-relaxed text-gray-700 dark:text-gray-300">
+        <p className="font-bold text-teal-700 dark:text-teal-300 mb-3">Hybrid — Explicit MCP Nodes</p>
+        <pre>{`POST /api/hybrid/plan
+  │
+  ▼
+LangGraph StateGraph
+START → mcp_node_1
+  │
+  │  asyncio.gather(          ← Python parallel
+  │    get_warehouse_capacity,
+  │    optimize_route
+  │  )
+  │  then get_available_carriers
+  │
+  ▼
+mcp_node_2
+  │  get_carrier_quote
+  │  (tool-chains best_carrier)
+  ▼
+_after_mcp_node_2
+  │ error? ──► END
+  ▼
+plan_gate ──► interrupt()
+             ← Gate 1
+  │ POST /api/hybrid/plan/confirm
+  ▼
+create_shipment (direct GQL)
+  ▼
+dock_gate ──► interrupt()
+             ← Gate 2
+  │ POST /api/hybrid/dock/confirm
+  ▼
+book_dock → END`}
         </pre>
       </div>
     </div>
@@ -329,18 +415,19 @@ export default function AgentComparison() {
         <h1 className="text-3xl font-bold text-gray-900 dark:text-white">
           Agentic Shipment Planning — Study Guide
         </h1>
-        <p className="text-gray-500 dark:text-gray-400 max-w-2xl mx-auto">
-          Two implementations of the same business flow demonstrating different
-          agentic architectures: <strong>LangGraph ReAct + MCP</strong> (V1) vs.{' '}
-          <strong>LangGraph StateGraph + Apollo Supergraph</strong> (V3).
-          Explore the live demos, compare the approaches, and read the concept glossary below.
+        <p className="text-gray-500 dark:text-gray-400 max-w-3xl mx-auto">
+          Three implementations of the same business flow demonstrating different agentic architectures.
+          Explore the live demos, compare approaches, and read the concept glossary below.
         </p>
-        <div className="flex gap-3 justify-center pt-2">
+        <div className="flex flex-wrap gap-3 justify-center pt-2">
           <Link to="/plan/v1" className="px-5 py-2.5 bg-amber-500 hover:bg-amber-600 text-white font-semibold rounded-lg transition-colors">
-            🤖 Try V1 — ReAct Agent
+            🤖 Try V1 — ReAct + MCP
           </Link>
           <Link to="/plan/v3" className="px-5 py-2.5 bg-violet-600 hover:bg-violet-700 text-white font-semibold rounded-lg transition-colors">
             🔗 Try V3 — StateGraph
+          </Link>
+          <Link to="/plan/hybrid" className="px-5 py-2.5 bg-teal-600 hover:bg-teal-700 text-white font-semibold rounded-lg transition-colors">
+            🔀 Try Hybrid — MCP Nodes
           </Link>
         </div>
       </div>
@@ -348,9 +435,10 @@ export default function AgentComparison() {
       {/* Side-by-side cards */}
       <section>
         <h2 className="text-lg font-bold text-gray-700 dark:text-gray-300 mb-4">Architecture Comparison</h2>
-        <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+        <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
           <VersionCard data={V1} />
           <VersionCard data={V3} />
+          <VersionCard data={HYBRID} />
         </div>
       </section>
 
@@ -379,26 +467,35 @@ export default function AgentComparison() {
       {/* When to use which */}
       <section>
         <h2 className="text-lg font-bold text-gray-700 dark:text-gray-300 mb-4">When to Use Which</h2>
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
           <div className="bg-amber-50 dark:bg-amber-900/10 border border-amber-200 dark:border-amber-700 rounded-xl p-5">
-            <h3 className="font-semibold text-amber-700 dark:text-amber-300 mb-3">🤖 Choose V1 (ReAct + MCP) when…</h3>
+            <h3 className="font-semibold text-amber-700 dark:text-amber-300 mb-3">🤖 Choose V1 when…</h3>
             <ul className="space-y-2 text-sm text-gray-700 dark:text-gray-300">
-              <li>• The sequence of steps is not known up front</li>
+              <li>• The step sequence is not known up front</li>
               <li>• Users ask open-ended / exploratory questions</li>
-              <li>• You want to add new capabilities without changing orchestration (just add a .graphql file)</li>
-              <li>• Individual mutation approval is important for every write</li>
-              <li>• You prefer the MCP standard for tool interoperability</li>
+              <li>• You want to add tools without changing orchestration</li>
+              <li>• Individual mutation approval matters for every write</li>
+              <li>• You prefer MCP for tool interoperability</li>
             </ul>
           </div>
           <div className="bg-violet-50 dark:bg-violet-900/10 border border-violet-200 dark:border-violet-700 rounded-xl p-5">
-            <h3 className="font-semibold text-violet-700 dark:text-violet-300 mb-3">🔗 Choose V3 (StateGraph + Apollo) when…</h3>
+            <h3 className="font-semibold text-violet-700 dark:text-violet-300 mb-3">🔗 Choose V3 when…</h3>
             <ul className="space-y-2 text-sm text-gray-700 dark:text-gray-300">
-              <li>• The business process is well-defined and sequential</li>
-              <li>• You want deterministic, auditable execution</li>
-              <li>• Read parallelism matters (Apollo Router fan-out)</li>
-              <li>• You want Apollo Gateway-level caching of subgraph responses</li>
-              <li>• Two explicit review gates are the right UX (plan then dock)</li>
-              <li>• Early-exit on missing data (error-stop before Gate 1)</li>
+              <li>• The flow is well-defined and deterministic</li>
+              <li>• Apollo Router fan-out and caching matter</li>
+              <li>• You want minimal Python code for reads</li>
+              <li>• Two explicit review gates are the right UX</li>
+              <li>• Early-exit on missing data before Gate 1</li>
+            </ul>
+          </div>
+          <div className="bg-teal-50 dark:bg-teal-900/10 border border-teal-200 dark:border-teal-700 rounded-xl p-5">
+            <h3 className="font-semibold text-teal-700 dark:text-teal-300 mb-3">🔀 Choose Hybrid when…</h3>
+            <ul className="space-y-2 text-sm text-gray-700 dark:text-gray-300">
+              <li>• You want reads via MCP but explicit control over parallelism</li>
+              <li>• Teaching asyncio.gather() in an agent context</li>
+              <li>• Tool chains between nodes need to be visible in code</li>
+              <li>• You don't have Apollo Router but want parallel reads</li>
+              <li>• Same two-gate HITL UX as V3 is the goal</li>
             </ul>
           </div>
         </div>

@@ -14,6 +14,10 @@ Endpoints
   POST /api/v3/plan            V3: Apollo supergraph fan-out → plan (Gate 1 HITL)
   POST /api/v3/plan/confirm    V3: Gate 1 resume → CreateShipment + BookCarrier
   POST /api/v3/dock/confirm    V3: Gate 2 resume → BookDockSlot (approve/skip)
+
+  POST /api/hybrid/plan          Hybrid: explicit MCP nodes (asyncio.gather) → plan (Gate 1 HITL)
+  POST /api/hybrid/plan/confirm  Hybrid: Gate 1 resume → CreateShipment + BookCarrier
+  POST /api/hybrid/dock/confirm  Hybrid: Gate 2 resume → BookDockSlot (approve/skip)
 """
 import json
 import os
@@ -31,6 +35,11 @@ from agent_v3 import (
     start_plan   as start_plan_v3,
     confirm_plan as confirm_plan_v3,
     confirm_dock as confirm_dock_v3,
+)
+from agent_hybrid import (
+    start_plan   as start_plan_hybrid,
+    confirm_plan as confirm_plan_hybrid,
+    confirm_dock as confirm_dock_hybrid,
 )
 from config import GRAPHQL_ENDPOINT
 from models import (
@@ -331,6 +340,96 @@ async def v3_confirm_dock(body: V3ConfirmRequest):
     """
     try:
         return await confirm_dock_v3(body.threadId, body.approved)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+# ── Hybrid Shipment Planner (LangGraph StateGraph + explicit MCP tool nodes) ──
+#
+# Three-phase HITL flow, same gates as V3, but reads use named MCP tools
+# with asyncio.gather() for Python-side parallelism instead of Apollo supergraph.
+#
+#   Phase 1  POST /api/hybrid/plan          mcp_node_1 (gather) + mcp_node_2 (quote)
+#                                            Pauses at Gate 1 (plan review)
+#   Phase 2  POST /api/hybrid/plan/confirm  Gate 1 resume → CreateShipment + BookCarrier
+#                                            Pauses at Gate 2 (dock slot review)
+#   Phase 3  POST /api/hybrid/dock/confirm  Gate 2 resume → BookDockSlot (if approved)
+
+@app.post("/api/hybrid/plan", tags=["Planning Hybrid (MCP + LangGraph)"])
+async def hybrid_start_plan(body: PlanShipmentRequest):
+    """
+    Hybrid Phase 1 — explicit MCP tool nodes.
+
+    mcp_node_1 calls get_warehouse_capacity and optimize_route in parallel
+    (asyncio.gather), then calls get_available_carriers sequentially (needs
+    origin postal from the first pair).
+
+    mcp_node_2 tool-chains into get_carrier_quote using the best carrier found
+    in mcp_node_1.
+
+    Nothing is written to the DB. Returns ``needs_plan_confirmation`` with the
+    full plan for Gate 1 review, or ``error`` if any MCP tool fails.
+    """
+    try:
+        request_dict = {
+            "originWarehouseId": body.originWarehouseId,
+            "destinationAddress": {
+                "street":     body.destinationAddress.street or "",
+                "city":       body.destinationAddress.city,
+                "state":      body.destinationAddress.state or "",
+                "country":    body.destinationAddress.country,
+                "postalCode": body.destinationAddress.postalCode,
+            },
+            "items": [
+                {
+                    "sku":                   i.sku,
+                    "description":           i.description,
+                    "quantity":              i.quantity,
+                    "weight":                i.weight,
+                    "volume":                i.volume,
+                    "value":                 i.value,
+                    "hazardous":             i.hazardous,
+                    "temperatureControlled": i.temperatureControlled,
+                    "fragile":               i.fragile,
+                }
+                for i in body.items
+            ],
+            "priority":             body.priority,
+            "requiredDeliveryDate": body.requiredDeliveryDate,
+            "specialInstructions":  body.specialInstructions or "",
+        }
+        return await start_plan_hybrid(request_dict)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.post("/api/hybrid/plan/confirm", tags=["Planning Hybrid (MCP + LangGraph)"])
+async def hybrid_confirm_plan(body: V3ConfirmRequest):
+    """
+    Hybrid Gate 1 resume — human approved or rejected the plan.
+
+    - ``approved: true``  → CreateShipment + BookCarrier run (direct GraphQL);
+                            response is ``needs_dock_confirmation`` (Gate 2).
+    - ``approved: false`` → nothing is written; response is ``rejected_at_plan``.
+    """
+    try:
+        return await confirm_plan_hybrid(body.threadId, body.approved)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.post("/api/hybrid/dock/confirm", tags=["Planning Hybrid (MCP + LangGraph)"])
+async def hybrid_confirm_dock(body: V3ConfirmRequest):
+    """
+    Hybrid Gate 2 resume — human approved or skipped the dock-slot booking.
+
+    - ``approved: true``  → BookDockSlot executes (direct GraphQL); ``dockBooked: true``.
+    - ``approved: false`` → dock slot skipped; shipment + carrier booking remain active.
+
+    Response ``status`` is always ``"done"``.
+    """
+    try:
+        return await confirm_dock_hybrid(body.threadId, body.approved)
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
 

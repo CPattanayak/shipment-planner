@@ -5,8 +5,9 @@ const NAV_GROUPS = [
   {
     label: 'Plan Shipment',
     items: [
-      { to: '/plan/v1', label: 'V1 · ReAct Agent',      badge: 'MCP',         color: 'amber'  },
-      { to: '/plan/v3', label: 'V3 · StateGraph',        badge: 'LangGraph',   color: 'violet' },
+      { to: '/plan/v1',     label: 'V1 · ReAct',    badge: 'MCP',         color: 'amber'  },
+      { to: '/plan/v3',     label: 'V3 · Graph',     badge: 'LangGraph',   color: 'violet' },
+      { to: '/plan/hybrid', label: 'Hybrid · MCP↑↑', badge: 'asyncio',     color: 'teal'   },
     ],
   },
   {
@@ -23,12 +24,14 @@ const NAV_GROUPS = [
 const BADGE_COLORS = {
   amber:  'bg-amber-400/20 text-amber-200 ring-1 ring-amber-300/30',
   violet: 'bg-violet-400/20 text-violet-200 ring-1 ring-violet-300/30',
+  teal:   'bg-teal-400/20 text-teal-200 ring-1 ring-teal-300/30',
 };
 
 export default function Layout({ children }) {
   const location = useLocation();
-  const isPlanV1 = location.pathname.startsWith('/plan/v1');
-  const isPlanV3 = location.pathname.startsWith('/plan/v3');
+  const isPlanV1     = location.pathname.startsWith('/plan/v1');
+  const isPlanV3     = location.pathname.startsWith('/plan/v3');
+  const isPlanHybrid = location.pathname.startsWith('/plan/hybrid');
 
   return (
     <div className="min-h-screen flex flex-col">
@@ -85,15 +88,15 @@ export default function Layout({ children }) {
         </div>
 
         {/* ── Version context strip ─────────────────────────────────────── */}
-        {(isPlanV1 || isPlanV3) && (
+        {(isPlanV1 || isPlanV3 || isPlanHybrid) && (
           <div className={`text-xs text-center py-1 font-medium ${
-            isPlanV1
-              ? 'bg-amber-500/30 text-amber-100'
-              : 'bg-violet-500/30 text-violet-100'
+            isPlanV1     ? 'bg-amber-500/30 text-amber-100'  :
+            isPlanHybrid ? 'bg-teal-500/30  text-teal-100'   :
+                           'bg-violet-500/30 text-violet-100'
           }`}>
-            {isPlanV1
-              ? '📖 V1 Study Mode — LangGraph ReAct Agent · MCP Tools · Per-mutation HITL interrupt()'
-              : '📖 V3 Study Mode — LangGraph StateGraph · Apollo Supergraph fan-out · Two-gate HITL interrupt()'}
+            {isPlanV1     ? '📖 V1 Study Mode — LangGraph ReAct Agent · MCP Tools · Per-mutation HITL interrupt()'
+            : isPlanHybrid ? '📖 Hybrid Study Mode — Explicit MCP Nodes · asyncio.gather() · Tool chain · Two-gate HITL'
+            :                '📖 V3 Study Mode — LangGraph StateGraph · Apollo Supergraph fan-out · Two-gate HITL interrupt()'}
           </div>
         )}
       </header>
