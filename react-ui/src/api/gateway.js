@@ -93,6 +93,18 @@ export const confirmPlanHybrid   = (threadId, approved) => post(`${HYBRID}/plan/
  */
 export const confirmDockHybrid   = (threadId, approved) => post(`${HYBRID}/dock/confirm`, { threadId, approved });
 
+/* ─── Planning V4 (LLM MCP reads + direct GraphQL mutations) ────────────── */
+
+const V4 = '/api/v4';
+
+/**
+ * Phase 1 — LLM agentic loop over 4 MCP read tools.
+ * Returns { status: "needs_plan_confirmation", threadId, plan }
+ */
+export const planShipmentV4  = (body)               => post(`${V4}/plan`,         body);
+export const confirmPlanV4   = (threadId, approved) => post(`${V4}/plan/confirm`, { threadId, approved });
+export const confirmDockV4   = (threadId, approved) => post(`${V4}/dock/confirm`, { threadId, approved });
+
 /* ─── AI Planning V1 (LangGraph HITL — kept for reference) ──────────────── */
 
 export const planShipmentV1  = (body)               => post(`${V1}/plan`,         body);

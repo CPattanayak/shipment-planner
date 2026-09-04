@@ -8,6 +8,7 @@ const NAV_GROUPS = [
       { to: '/plan/v1',     label: 'V1 · ReAct',    badge: 'MCP',         color: 'amber'  },
       { to: '/plan/v3',     label: 'V3 · Graph',     badge: 'LangGraph',   color: 'violet' },
       { to: '/plan/hybrid', label: 'Hybrid · MCP↑↑', badge: 'asyncio',     color: 'teal'   },
+      { to: '/plan/v4',     label: 'V4 · LLM+MCP',   badge: 'LLM reads',   color: 'sky'    },
     ],
   },
   {
@@ -25,6 +26,7 @@ const BADGE_COLORS = {
   amber:  'bg-amber-400/20 text-amber-200 ring-1 ring-amber-300/30',
   violet: 'bg-violet-400/20 text-violet-200 ring-1 ring-violet-300/30',
   teal:   'bg-teal-400/20 text-teal-200 ring-1 ring-teal-300/30',
+  sky:    'bg-sky-400/20 text-sky-200 ring-1 ring-sky-300/30',
 };
 
 export default function Layout({ children }) {
@@ -32,6 +34,7 @@ export default function Layout({ children }) {
   const isPlanV1     = location.pathname.startsWith('/plan/v1');
   const isPlanV3     = location.pathname.startsWith('/plan/v3');
   const isPlanHybrid = location.pathname.startsWith('/plan/hybrid');
+  const isPlanV4     = location.pathname.startsWith('/plan/v4');
 
   return (
     <div className="min-h-screen flex flex-col">
@@ -88,14 +91,16 @@ export default function Layout({ children }) {
         </div>
 
         {/* ── Version context strip ─────────────────────────────────────── */}
-        {(isPlanV1 || isPlanV3 || isPlanHybrid) && (
+        {(isPlanV1 || isPlanV3 || isPlanHybrid || isPlanV4) && (
           <div className={`text-xs text-center py-1 font-medium ${
             isPlanV1     ? 'bg-amber-500/30 text-amber-100'  :
             isPlanHybrid ? 'bg-teal-500/30  text-teal-100'   :
+            isPlanV4     ? 'bg-sky-500/30   text-sky-100'    :
                            'bg-violet-500/30 text-violet-100'
           }`}>
             {isPlanV1     ? '📖 V1 Study Mode — LangGraph ReAct Agent · MCP Tools · Per-mutation HITL interrupt()'
             : isPlanHybrid ? '📖 Hybrid Study Mode — Explicit MCP Nodes · asyncio.gather() · Tool chain · Two-gate HITL'
+            : isPlanV4    ? '📖 V4 Study Mode — LLM agentic loop over MCP reads · Direct GraphQL mutations · Two-gate HITL'
             :                '📖 V3 Study Mode — LangGraph StateGraph · Apollo Supergraph fan-out · Two-gate HITL interrupt()'}
           </div>
         )}

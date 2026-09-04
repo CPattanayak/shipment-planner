@@ -41,6 +41,11 @@ from agent_hybrid import (
     confirm_plan as confirm_plan_hybrid,
     confirm_dock as confirm_dock_hybrid,
 )
+from agent_v4 import (
+    start_plan   as start_plan_v4,
+    confirm_plan as confirm_plan_v4,
+    confirm_dock as confirm_dock_v4,
+)
 from config import GRAPHQL_ENDPOINT
 from models import (
     AskRequest,
@@ -430,6 +435,57 @@ async def hybrid_confirm_dock(body: V3ConfirmRequest):
     """
     try:
         return await confirm_dock_hybrid(body.threadId, body.approved)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+# ── V4: LLM-driven MCP reads + direct GraphQL mutations ──────────────────────
+#
+#   Phase 1  POST /api/v4/plan          LLM agentic loop over MCP read tools → plan (Gate 1 HITL)
+#            LLM calls GetWarehouseCapacity → OptimizeRoute → GetAvailableCarriers → GetCarrierQuote
+#   Phase 2  POST /api/v4/plan/confirm  Gate 1 resume → CreateShipment + BookCarrier (direct GQL)
+#   Phase 3  POST /api/v4/dock/confirm  Gate 2 resume → BookDockSlot (if approved)
+
+@app.post("/api/v4/plan", tags=["Planning V4 (LLM MCP + direct GraphQL)"])
+async def v4_start_plan(body: PlanShipmentRequest):
+    """
+    V4 Phase 1 — LLM drives 4 MCP read tools, then pauses at Gate 1.
+
+    The LLM calls tools in order via its tool-use loop:
+      GetWarehouseCapacity → OptimizeRoute → GetAvailableCarriers → GetCarrierQuote
+
+    Returns { status: "needs_plan_confirmation", threadId, plan } or { status: "error" }.
+    Nothing is written to the DB until /confirm is called.
+    """
+    request_dict = body.model_dump(by_alias=False)
+    try:
+        return await start_plan_v4(request_dict)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.post("/api/v4/plan/confirm", tags=["Planning V4 (LLM MCP + direct GraphQL)"])
+async def v4_confirm_plan(body: V3ConfirmRequest):
+    """
+    V4 Gate 1 resume.
+    approved=true  → CreateShipment + BookCarrier (direct GraphQL) → Gate 2
+    approved=false → graph ends; nothing written
+    """
+    try:
+        return await confirm_plan_v4(body.threadId, body.approved)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.post("/api/v4/dock/confirm", tags=["Planning V4 (LLM MCP + direct GraphQL)"])
+async def v4_confirm_dock(body: V3ConfirmRequest):
+    """
+    V4 Gate 2 resume.
+    approved=true  → BookDockSlot (direct GraphQL) → dockBooked: true
+    approved=false → dock skipped → dockBooked: false
+    """
+    try:
+        return await confirm_dock_v4(body.threadId, body.approved)
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
 
