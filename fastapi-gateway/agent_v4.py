@@ -146,7 +146,7 @@ def _clean_error(exc_or_str) -> str:
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
-READ_TOOLS = {"GetWarehouseCapacity", "OptimizeRoute", "GetAvailableCarriers", "GetCarrierQuote"}
+# READ_TOOLS = {"GetWarehouseCapacity", "OptimizeRoute", "GetAvailableCarriers", "GetCarrierQuote"}
 
 SYSTEM_PROMPT = (
     "You are a shipment planning agent. Call tools in exactly THREE rounds:\n\n"
@@ -234,7 +234,7 @@ async def llm_plan_node(state: V4State) -> dict:
     # ── Build MCP client and filter to read tools only ────────────────────────
     client    = MultiServerMCPClient(_MCP_CFG)
     all_tools = await client.get_tools()
-    tool_map  = {t.name: t for t in all_tools if t.name in READ_TOOLS}
+    tool_map  = {t.name: t for t in all_tools if t.name in _STEP_MAP}
     log.info("v4 llm_plan_node: read_tools=%s", list(tool_map.keys()))
 
     # ── Bind tools to LLM ─────────────────────────────────────────────────────
