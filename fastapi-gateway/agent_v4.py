@@ -207,18 +207,10 @@ class V4State(TypedDict):
 
 
 # ── LLM plan node ─────────────────────────────────────────────────────────────
-
 async def llm_plan_node(state: V4State) -> dict:
     """
-    Phase 1 — LLM agentic tool-use loop.
-
-    The LLM is given all four MCP read tools and a system prompt that instructs
-    it to call them in order.  It drives the loop entirely; Python only executes
-    whatever tool calls the LLM emits and feeds the results back as ToolMessages.
-
-    After the loop ends (no more tool_calls), each raw result is processed
-    through its MCPToolStep.extract() + validate() — same logic and log format
-    as the Hybrid pipeline — so errors surface consistently.
+    Phase 1 — LLM agentic tool-use loop with deduplication.
+    Prevents duplicate tool calls while preserving parallel execution.
     """
     req   = state["request"]
     dst   = req["destinationAddress"]
@@ -260,12 +252,9 @@ async def llm_plan_node(state: V4State) -> dict:
         HumanMessage(content=json.dumps(request_payload)),
     ]
 
-    # ── Agentic loop — LLM decides which tools to call ────────────────────────
-    # When the LLM emits multiple tool_calls in one response (e.g. Round 1:
-    # GetWarehouseCapacity + OptimizeRoute) we run them concurrently with
-    # asyncio.gather() so independent tools don't wait on each other.
     raw_results: dict = {}
 
+    # ── Agentic loop ─────────────────────────────────────────────────────────
     while True:
         response = await llm_with_tools.ainvoke(messages)
         messages.append(response)
@@ -277,36 +266,52 @@ async def llm_plan_node(state: V4State) -> dict:
         valid = [tc for tc in response.tool_calls if tc["name"] in tool_map]
         unknown = [tc["name"] for tc in response.tool_calls if tc["name"] not in tool_map]
         if unknown:
-            log.warning("v4 llm_plan_node: LLM tried unknown tools %s, skipping", unknown)
+            log.warning("LLM tried unknown tools %s, skipping", unknown)
 
         if not valid:
             continue
+
+        # Deduplication: split into new vs already-called (dicts keyed by tool name)
+        new_calls: dict[str, dict] = {}
+        reuse_calls: dict[str, dict] = {}
+        for tc in valid:
+            if tc["name"] in raw_results:
+                reuse_calls[tc["name"]] = tc
+            else:
+                new_calls[tc["name"]] = tc
 
         log.info("→ round: %s%s",
                  [tc["name"] for tc in valid],
                  "  [parallel]" if len(valid) > 1 else "")
 
-        # Execute all tool calls in this round in parallel
-        try:
-            results = await asyncio.gather(*[
-                tool_map[tc["name"]].ainvoke(tc["args"]) for tc in valid
-            ])
-        except Exception as exc:
-            clean = _clean_error(exc)
-            log.error("v4 llm_plan_node: tool gather raised: %s", clean)
-            return {"messages": messages, "status": "error", "error": clean}
-
-        for tc, result in zip(valid, results):
-            raw_results[tc["name"]] = result
+        # Inject cached results for duplicates
+        for name, tc in reuse_calls.items():
+            cached = raw_results[name]
             messages.append(
-                ToolMessage(content=str(result), tool_call_id=tc["id"], name=tc["name"])
+                ToolMessage(content=str(cached), tool_call_id=tc["id"], name=name)
             )
+            log.info("↺ reused cached result for %s", name)
 
-    log.info("v4 llm_plan_node: tools_called=%s", list(raw_results.keys()))
+        # Execute new tool calls in parallel
+        if new_calls:
+            try:
+                results = await asyncio.gather(*[
+                    tool_map[name].ainvoke(tc["args"]) for name, tc in new_calls.items()
+                ])
+            except Exception as exc:
+                clean = _clean_error(exc)
+                log.error("tool gather raised: %s", clean)
+                return {"messages": messages, "status": "error", "error": clean}
 
-    # ── Post-loop: extract + validate via MCPToolStep classes ─────────────────
-    # Build a ToolContext so extract() calls can chain (e.g. OptimizeRoute
-    # inputs read origin_postal that GetWarehouseCapacity wrote).
+            for (name, tc), result in zip(new_calls.items(), results):
+                raw_results[name] = result
+                messages.append(
+                    ToolMessage(content=str(result), tool_call_id=tc["id"], name=name)
+                )
+
+    log.info("tools_called=%s", list(raw_results.keys()))
+
+    # ── Post-loop: extract + validate ─────────────────────────────────────────
     ctx = ToolContext({
         "request":       req,
         "weight_kg":     weight_kg,
@@ -324,7 +329,6 @@ async def llm_plan_node(state: V4State) -> dict:
         parsed  = MCPToolStep._parse(raw)
         data    = parsed.get("data", parsed)
 
-        # Surface GraphQL errors
         gql_errors = parsed.get("errors") or data.get("errors")
         if gql_errors:
             first = gql_errors[0] if isinstance(gql_errors, list) else gql_errors
@@ -350,12 +354,11 @@ async def llm_plan_node(state: V4State) -> dict:
         summary = {
             k: (f"{str(v)[:60]}…" if isinstance(v, str) and len(v) > 60
                 else type(v).__name__ if not isinstance(v, (str, int, float, bool))
-                else v)
+            else v)
             for k, v in extracted.items()
         }
         log.info("✓ %-30s  → %s", tool_name, summary)
 
-    # ── Pack extracted context into a plan dict ───────────────────────────────
     raw_date      = (ctx.get("route") or {}).get("estimatedDeliveryDate", "")
     delivery_date = ctx.get("delivery_date") or (
         raw_date[:10] if raw_date else datetime.now(timezone.utc).strftime("%Y-%m-%d")
@@ -375,7 +378,7 @@ async def llm_plan_node(state: V4State) -> dict:
         "service_level": service_level,
     }
 
-    log.info("v4 llm_plan_node: plan ready — delivery=%s cost=%s",
+    log.info("plan ready — delivery=%s cost=%s",
              delivery_date, (ctx.get("quote") or {}).get("totalCost"))
     return {"messages": messages, "plan": plan, "status": "llm_done", "error": None}
 
