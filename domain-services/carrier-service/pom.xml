@@ -9,7 +9,10 @@
         <groupId>com.shipmentplanner</groupId>
         <artifactId>shipment-planner-parent</artifactId>
         <version>1.0.0</version>
-        <relativePath>../../pom.xml</relativePath>
+        <!-- Empty relativePath: resolve parent only from the local Maven repo
+             (installed by the Dockerfile's `mvn -f parent-pom.xml install -N` step),
+             never by filesystem path — that path doesn't exist in the Docker build context. -->
+        <relativePath/>
     </parent>
 
     <artifactId>carrier-service</artifactId>

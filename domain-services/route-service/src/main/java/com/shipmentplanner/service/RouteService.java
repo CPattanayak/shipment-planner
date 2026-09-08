@@ -1,5 +1,7 @@
 package com.shipmentplanner.service;
 
+import com.shipmentplanner.exception.BusinessException;
+import com.shipmentplanner.exception.BusinessException.ErrorType;
 import com.shipmentplanner.model.Route;
 import com.shipmentplanner.repository.RouteRepository;
 import org.springframework.stereotype.Service;
@@ -27,7 +29,7 @@ public class RouteService {
     @Transactional(readOnly = true)
     public Route getById(String id) {
         return routeRepository.findById(id)
-                .orElseThrow(() -> new RuntimeException("Route not found: " + id));
+                .orElseThrow(() -> new BusinessException(ErrorType.NOT_FOUND, "Route not found: " + id));
     }
 
     @Transactional(readOnly = true)
@@ -45,17 +47,15 @@ public class RouteService {
         String destinationPostalCode = (String) input.get("destinationPostalCode");
         Double weightKg = toDouble(input.get("weightKg"));
 
-        // Exact match first; fall back to any active route from the same warehouse.
+        // Exact match on warehouse + destination postal code only.
+        // No fallback — an address with no configured route is an error,
+        // not an invitation to silently pick a wrong route.
         List<Route> available = availableRoutes(originWarehouseId, destinationPostalCode);
         if (available.isEmpty()) {
-            available = routeRepository.findByOriginWarehouseId(originWarehouseId)
-                    .stream()
-                    .filter(r -> "ACTIVE".equals(r.getStatus()))
-                    .collect(Collectors.toList());
-        }
-        if (available.isEmpty()) {
-            throw new RuntimeException(
-                    "No routes available from warehouse " + originWarehouseId);
+            throw new BusinessException(ErrorType.NOT_FOUND,
+                    "No route from warehouse " + originWarehouseId
+                    + " to postal code " + destinationPostalCode
+                    + ". Configure a route for this destination first.");
         }
 
         Route recommended = available.get(0);

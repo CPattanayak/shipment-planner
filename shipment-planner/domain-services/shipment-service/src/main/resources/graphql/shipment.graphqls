@@ -1,0 +1,122 @@
+extend schema
+  @link(url: "https://specs.apollo.dev/federation/v2.3",
+        import: ["@key", "@shareable", "@external", "@requires"])
+
+type Query {
+  shipment(id: ID!): Shipment
+  shipments(status: ShipmentStatus, limit: Int = 20, offset: Int = 0): [Shipment!]!
+  shipmentsByOrigin(warehouseId: ID!): [Shipment!]!
+  shipmentsByCarrier(carrierId: ID!): [Shipment!]!
+}
+
+type Mutation {
+  createShipment(input: CreateShipmentInput!): Shipment!
+  updateShipmentStatus(id: ID!, status: ShipmentStatus!, notes: String): Shipment!
+  assignCarrier(shipmentId: ID!, carrierId: ID!): Shipment!
+  assignRoute(shipmentId: ID!, routeId: ID!): Shipment!
+  cancelShipment(id: ID!, reason: String!): Shipment!
+}
+
+type Shipment @key(fields: "id") {
+  id: ID!
+  trackingNumber: String!
+  status: ShipmentStatus!
+  priority: ShipmentPriority!
+  originWarehouseId: ID!
+  destinationAddress: Address!
+  items: [ShipmentItem!]!
+  totalWeight: Float!
+  totalVolume: Float!
+  totalValue: Float!
+  carrierId: ID
+  routeId: ID
+  estimatedDelivery: String
+  actualDelivery: String
+  scheduledPickup: String
+  specialInstructions: String
+  statusHistory: [StatusEvent!]!
+  createdAt: String!
+  updatedAt: String!
+}
+
+type ShipmentItem {
+  id: ID!
+  sku: String!
+  description: String!
+  quantity: Int!
+  weight: Float!
+  volume: Float!
+  value: Float!
+  hazardous: Boolean!
+  temperatureControlled: Boolean!
+  fragile: Boolean!
+}
+
+type Address @shareable {
+  street: String
+  city: String!
+  state: String
+  country: String!
+  postalCode: String!
+  coordinates: GeoCoordinates
+}
+
+type GeoCoordinates @shareable {
+  lat: Float!
+  lng: Float!
+}
+
+type StatusEvent {
+  status: ShipmentStatus!
+  timestamp: String!
+  location: String
+  notes: String
+}
+
+enum ShipmentStatus {
+  DRAFT
+  PENDING_CARRIER
+  CARRIER_CONFIRMED
+  PICKUP_SCHEDULED
+  IN_TRANSIT
+  OUT_FOR_DELIVERY
+  DELIVERED
+  EXCEPTION
+  CANCELLED
+}
+
+enum ShipmentPriority {
+  STANDARD
+  EXPRESS
+  OVERNIGHT
+  SAME_DAY
+}
+
+input CreateShipmentInput {
+  originWarehouseId: ID!
+  destinationAddress: AddressInput!
+  items: [ShipmentItemInput!]!
+  priority: ShipmentPriority!
+  scheduledPickup: String
+  specialInstructions: String
+}
+
+input AddressInput {
+  street: String
+  city: String!
+  state: String
+  country: String!
+  postalCode: String!
+}
+
+input ShipmentItemInput {
+  sku: String!
+  description: String!
+  quantity: Int!
+  weight: Float!
+  volume: Float!
+  value: Float!
+  hazardous: Boolean = false
+  temperatureControlled: Boolean = false
+  fragile: Boolean = false
+}

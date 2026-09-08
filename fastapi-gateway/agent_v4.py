@@ -3,14 +3,17 @@ Shipment Planning — V4 (LangGraph StateGraph + LLM agentic loop over MCP read 
 
 Architecture
 ────────────
-  llm_plan_node   LLM (ChatOpenAI via OpenRouter) with MCP read tools bound.
-                  Runs an agentic loop that calls exactly 4 tools IN ORDER:
-                    1) GetWarehouseCapacity
-                    2) OptimizeRoute
-                    3) GetAvailableCarriers
-                    4) GetCarrierQuote
-                  After the loop, structured plan data is extracted from the
-                  ToolMessage results stored in the message history.
+  llm_plan_node   LLM (ChatOpenAI via OpenRouter) with all four MCP read tools
+                  bound.  The LLM runs a native tool-use loop and decides:
+                    • which tools to call
+                    • in what order
+                    • with what arguments
+                  guided by a system prompt.
+
+                  After the loop, raw tool results are processed through the
+                  mcp_pipeline MCPToolStep classes — their extract() and
+                  validate() methods normalise and validate each result with the
+                  same standardised ✓ / ✗ logging used by the Hybrid pipeline.
 
   plan_gate       HLT interrupt — Gate 1: human reviews plan; nothing written yet.
 
@@ -22,14 +25,28 @@ Architecture
 
 vs Hybrid
 ─────────
-  Hybrid explicitly orchestrates each MCP call in Python and uses asyncio.gather()
-  for parallelism.  V4 delegates the orchestration to the LLM: the model decides
-  when to call each tool and with what arguments, guided by a system prompt that
-  instructs it to call them in a fixed sequence and never call mutations.
+  Hybrid uses run_planning_pipeline() — a fixed PLANNING_STEPS list the Python
+  code executes deterministically.
+
+  V4 lets the LLM orchestrate the same four tools via its native tool-use loop.
+  The LLM controls order and arguments; any MCP-exposing service can be added by
+  simply passing more tools to bind_tools() and updating the system prompt — no
+  Python orchestration changes required.
+
+  Both share the MCPToolStep classes for result extraction and validation, so
+  error messages and log format are identical across both agents.
+
+Imports
+───────
+  agent_hitl   — imported for side-effects only: patches MCP protocol version.
+  agent_v3     — _gql / _check helpers and the three mutation strings.
+  mcp_pipeline — MCPToolStep subclasses reused for extract() + validate().
 """
 
+import asyncio
 import json
 import logging
+import re
 import uuid
 from datetime import datetime, timezone
 from typing import Optional
@@ -39,7 +56,7 @@ import agent_hitl  # noqa: F401 — side-effect: patches MCP protocol version
 
 from langchain_mcp_adapters.client import MultiServerMCPClient
 from langchain_openai import ChatOpenAI
-from langchain_core.messages import SystemMessage, HumanMessage, ToolMessage, AIMessage
+from langchain_core.messages import SystemMessage, HumanMessage, ToolMessage
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import Command, interrupt
@@ -57,23 +74,111 @@ from config import (
     OPENROUTER_BASE_URL,
     OPENROUTER_MODEL,
 )
+from mcp_pipeline import (
+    ToolContext,
+    MCPToolStep,
+    GetWarehouseCapacityStep,
+    OptimizeRouteStep,
+    GetAvailableCarriersStep,
+    GetCarrierQuoteStep,
+)
 
 log = logging.getLogger(__name__)
 
+
+def _clean_error(exc_or_str) -> str:
+    """
+    Extract a clean, human-readable message from an exception or raw string that
+    may contain a JSON GraphQL error response, a FastAPI detail blob, or a
+    Python repr of an errors list.
+
+    Priority:
+      1. JSON body → errors[0].message
+      2. JSON body → detail (string)
+      3. Python-repr list → first element's 'message' key
+      4. Original string as-is
+    """
+    s = str(exc_or_str)
+
+    # 1. Try to parse a JSON object inside the string
+    match = re.search(r'\{.*\}', s, re.DOTALL)
+    if match:
+        try:
+            data = json.loads(match.group())
+            # GraphQL errors array
+            errors = data.get("errors")
+            if isinstance(errors, list) and errors:
+                msg = errors[0].get("message") if isinstance(errors[0], dict) else None
+                if msg:
+                    return msg
+            # FastAPI detail
+            detail = data.get("detail")
+            if isinstance(detail, str) and detail:
+                # detail might itself be a JSON string
+                try:
+                    inner = json.loads(detail)
+                    errors2 = inner.get("errors")
+                    if isinstance(errors2, list) and errors2:
+                        msg = errors2[0].get("message") if isinstance(errors2[0], dict) else None
+                        if msg:
+                            return msg
+                except Exception:
+                    pass
+                return detail
+        except Exception:
+            pass
+
+    # 2. Python repr of a list, e.g. "[{'message': 'No route...', ...}]"
+    match2 = re.search(r"\[.*\]", s, re.DOTALL)
+    if match2:
+        try:
+            import ast
+            items = ast.literal_eval(match2.group())
+            if isinstance(items, list) and items:
+                first = items[0]
+                if isinstance(first, dict) and first.get("message"):
+                    return first["message"]
+        except Exception:
+            pass
+
+    return s
+
+
 # ── Constants ─────────────────────────────────────────────────────────────────
 
-READ_TOOLS = {"GetWarehouseCapacity", "OptimizeRoute", "GetAvailableCarriers", "GetCarrierQuote"}
+# READ_TOOLS = {"GetWarehouseCapacity", "OptimizeRoute", "GetAvailableCarriers", "GetCarrierQuote"}
 
 SYSTEM_PROMPT = (
-    "You are a shipment planning agent. "
-    "Call these tools IN ORDER, each ONCE:\n"
-    "  1) GetWarehouseCapacity(id=warehouseId)\n"
-    "  2) OptimizeRoute(originWarehouseId, destinationPostalCode, destinationCountry, weightKg, volumeM3)\n"
-    "  3) GetAvailableCarriers(originPostalCode from step 1, destinationPostalCode, weightKg)\n"
-    "  4) GetCarrierQuote(carrierId=best carrier by onTimeDeliveryRate, originPostalCode, "
-    "destinationPostalCode, weightKg, volumeM3, serviceLevel)\n"
-    "Do not call any other tools. Do not call mutations."
+    "You are a shipment planning agent. Call tools in exactly THREE rounds:\n\n"
+    "Round 1 — call BOTH simultaneously in a single response (they are independent):\n"
+    "  • GetWarehouseCapacity(id=warehouseId)\n"
+    "  • OptimizeRoute(originWarehouseId, destinationPostalCode, destinationCountry, weightKg, volumeM3)\n\n"
+    "Round 2 — after Round 1 results arrive, call:\n"
+    "  • GetAvailableCarriers(originPostalCode=<postalCode from GetWarehouseCapacity result>, "
+    "destinationPostalCode, weightKg)\n\n"
+    "Round 3 — after Round 2 results arrive:\n"
+    "  1. From the GetAvailableCarriers result, pick the carrier with the HIGHEST "
+    "performance.onTimeDeliveryRate.\n"
+    "  2. Use that carrier's `id` field as carrierId — this is the full string identifier "
+    "(e.g. 'carrier-abc-123'), NOT the carrier `code` (e.g. 'SRC'), NOT the `name`. "
+    "The `id` field is what the system uses to look up the carrier; using any other field "
+    "will cause a 'Carrier not found' error.\n"
+    "  3. Call: GetCarrierQuote(carrierId=<carrier.id>, originPostalCode, "
+    "destinationPostalCode, weightKg, volumeM3, serviceLevel)\n\n"
+    "Do NOT call any other tools. Do NOT call mutations. "
+    "Always emit Round 1 tools together in one response."
 )
+
+# Map each MCP tool name to the MCPToolStep that knows how to extract/validate it.
+# The LLM decides IF and WHEN to call each tool; the step handles result processing.
+_STEP_MAP: dict[str, MCPToolStep] = {
+    "GetWarehouseCapacity":  GetWarehouseCapacityStep(),
+    "OptimizeRoute":         OptimizeRouteStep(),
+    "GetAvailableCarriers":  GetAvailableCarriersStep(),
+    "GetCarrierQuote":       GetCarrierQuoteStep(),
+}
+
+_MCP_CFG = {"shipment-planner": {"transport": "streamable_http", "url": MCP_SERVER_URL}}
 
 
 # ── State ─────────────────────────────────────────────────────────────────────
@@ -85,7 +190,7 @@ class V4State(TypedDict):
     # input
     request: dict
 
-    # plan data extracted from tool results
+    # plan data — packed into a single dict after the LLM loop
     plan: dict
 
     # phase 2 — shipment + booking
@@ -101,30 +206,19 @@ class V4State(TypedDict):
     error: Optional[str]
 
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
-
-def _parse(raw) -> dict:
-    """Normalise an MCP tool result (str, list-of-blocks, or dict) → dict."""
-    if isinstance(raw, str):
-        try:
-            return json.loads(raw)
-        except json.JSONDecodeError:
-            return {}
-    if isinstance(raw, list):
-        text = " ".join(b.get("text", "") for b in raw if isinstance(b, dict))
-        try:
-            return json.loads(text)
-        except json.JSONDecodeError:
-            return {}
-    return raw if isinstance(raw, dict) else {}
-
-
 # ── LLM plan node ─────────────────────────────────────────────────────────────
 
 async def llm_plan_node(state: V4State) -> dict:
     """
-    Runs an LLM agentic loop that calls the 4 MCP read tools in order,
-    then extracts structured plan data from the ToolMessage results.
+    Phase 1 — LLM agentic tool-use loop.
+
+    The LLM is given all four MCP read tools and a system prompt that instructs
+    it to call them in order.  It drives the loop entirely; Python only executes
+    whatever tool calls the LLM emits and feeds the results back as ToolMessages.
+
+    After the loop ends (no more tool_calls), each raw result is processed
+    through its MCPToolStep.extract() + validate() — same logic and log format
+    as the Hybrid pipeline — so errors surface consistently.
     """
     req   = state["request"]
     dst   = req["destinationAddress"]
@@ -133,14 +227,14 @@ async def llm_plan_node(state: V4State) -> dict:
     weight_kg = sum(float(i.get("weight", 0)) * int(i.get("quantity", 1)) for i in items) or 100.0
     volume_m3 = sum(float(i.get("volume", 0)) * int(i.get("quantity", 1)) for i in items) or 1.0
     priority  = req.get("priority", "STANDARD")
+    service_level = "EXPRESS" if priority in ("EXPRESS", "OVERNIGHT", "SAME_DAY") else "STANDARD"
 
     log.info("v4 llm_plan_node: wh=%s dest=%s %.1fkg", req["originWarehouseId"], dst["postalCode"], weight_kg)
 
     # ── Build MCP client and filter to read tools only ────────────────────────
-    client    = MultiServerMCPClient({"shipment-planner": {"transport": "streamable_http", "url": MCP_SERVER_URL}})
+    client    = MultiServerMCPClient(_MCP_CFG)
     all_tools = await client.get_tools()
-    tool_map  = {t.name: t for t in all_tools if t.name in READ_TOOLS}
-
+    tool_map  = {t.name: t for t in all_tools if t.name in _STEP_MAP}
     log.info("v4 llm_plan_node: read_tools=%s", list(tool_map.keys()))
 
     # ── Bind tools to LLM ─────────────────────────────────────────────────────
@@ -152,14 +246,12 @@ async def llm_plan_node(state: V4State) -> dict:
     )
     llm_with_tools = llm.bind_tools(list(tool_map.values()))
 
-    # Enrich the human message with derived weight/volume so the LLM can pass
-    # them directly to OptimizeRoute / GetAvailableCarriers / GetCarrierQuote.
     request_payload = {
         **req,
         "_derived": {
             "weightKg":    weight_kg,
             "volumeM3":    volume_m3,
-            "serviceLevel": "EXPRESS" if priority in ("EXPRESS", "OVERNIGHT", "SAME_DAY") else "STANDARD",
+            "serviceLevel": service_level,
         },
     }
 
@@ -168,8 +260,10 @@ async def llm_plan_node(state: V4State) -> dict:
         HumanMessage(content=json.dumps(request_payload)),
     ]
 
-    # ── Agentic loop ──────────────────────────────────────────────────────────
-    # Keep raw tool results so _parse() sees the original object, not str(obj).
+    # ── Agentic loop — LLM decides which tools to call ────────────────────────
+    # When the LLM emits multiple tool_calls in one response (e.g. Round 1:
+    # GetWarehouseCapacity + OptimizeRoute) we run them concurrently with
+    # asyncio.gather() so independent tools don't wait on each other.
     raw_results: dict = {}
 
     while True:
@@ -179,122 +273,110 @@ async def llm_plan_node(state: V4State) -> dict:
         if not response.tool_calls:
             break
 
-        for tc in response.tool_calls:
-            if tc["name"] not in tool_map:
-                log.warning("v4 llm_plan_node: LLM tried unknown tool '%s', skipping", tc["name"])
-                continue
-            log.info("v4 llm_plan_node: calling tool=%s args=%s", tc["name"], tc["args"])
-            result = await tool_map[tc["name"]].ainvoke(tc["args"])
-            raw_results[tc["name"]] = result          # preserve original type
+        # Filter to known read tools only
+        valid = [tc for tc in response.tool_calls if tc["name"] in tool_map]
+        unknown = [tc["name"] for tc in response.tool_calls if tc["name"] not in tool_map]
+        if unknown:
+            log.warning("v4 llm_plan_node: LLM tried unknown tools %s, skipping", unknown)
+
+        if not valid:
+            continue
+
+        log.info("→ round: %s%s",
+                 [tc["name"] for tc in valid],
+                 "  [parallel]" if len(valid) > 1 else "")
+
+        # Execute all tool calls in this round in parallel
+        try:
+            results = await asyncio.gather(*[
+                tool_map[tc["name"]].ainvoke(tc["args"]) for tc in valid
+            ])
+        except Exception as exc:
+            clean = _clean_error(exc)
+            log.error("v4 llm_plan_node: tool gather raised: %s", clean)
+            return {"messages": messages, "status": "error", "error": clean}
+
+        for tc, result in zip(valid, results):
+            raw_results[tc["name"]] = result
             messages.append(
                 ToolMessage(content=str(result), tool_call_id=tc["id"], name=tc["name"])
             )
 
     log.info("v4 llm_plan_node: tools_called=%s", list(raw_results.keys()))
 
-    # Diagnose: dump raw result for GetWarehouseCapacity so we can see exactly what came back
-    cap_raw_obj = raw_results.get("GetWarehouseCapacity")
-    log.info("v4 GetWarehouseCapacity raw type=%s repr=%s",
-             type(cap_raw_obj).__name__, repr(cap_raw_obj)[:400])
+    # ── Post-loop: extract + validate via MCPToolStep classes ─────────────────
+    # Build a ToolContext so extract() calls can chain (e.g. OptimizeRoute
+    # inputs read origin_postal that GetWarehouseCapacity wrote).
+    ctx = ToolContext({
+        "request":       req,
+        "weight_kg":     weight_kg,
+        "volume_m3":     volume_m3,
+        "service_level": service_level,
+    })
 
-    if "GetWarehouseCapacity" not in raw_results:
-        return {
-            "messages": messages,
-            "status": "error",
-            "error": (
-                f"LLM did not call GetWarehouseCapacity. "
-                f"Tools actually called: {list(raw_results.keys())}. "
-                f"Check the system prompt or LLM tool-choice settings."
-            ),
+    for tool_name, step in _STEP_MAP.items():
+        raw = raw_results.get(tool_name)
+        if raw is None:
+            err = f"LLM did not call {tool_name}. Tools called: {list(raw_results.keys())}"
+            log.error("✗ %-30s  %s", tool_name, err)
+            return {"messages": messages, "status": "error", "error": err}
+
+        parsed  = MCPToolStep._parse(raw)
+        data    = parsed.get("data", parsed)
+
+        # Surface GraphQL errors
+        gql_errors = parsed.get("errors") or data.get("errors")
+        if gql_errors:
+            first = gql_errors[0] if isinstance(gql_errors, list) else gql_errors
+            raw_msg = first.get("message", str(gql_errors)) if isinstance(first, dict) else str(gql_errors)
+            err = f"[{tool_name}] {raw_msg}"
+            log.error("✗ %-30s  errors=%s", tool_name, gql_errors)
+            return {"messages": messages, "status": "error", "error": err}
+
+        try:
+            extracted = step.extract(data, ctx)
+        except Exception as exc:
+            err = f"{tool_name} extract() raised: {exc}"
+            log.error("✗ %-30s  %s", tool_name, err)
+            return {"messages": messages, "status": "error", "error": err}
+
+        validation_err = step.validate(extracted, ctx)
+        if validation_err:
+            log.warning("✗ %-30s  %s", tool_name, validation_err)
+            return {"messages": messages, "status": "error", "error": validation_err}
+
+        ctx.update(extracted)
+
+        summary = {
+            k: (f"{str(v)[:60]}…" if isinstance(v, str) and len(v) > 60
+                else type(v).__name__ if not isinstance(v, (str, int, float, bool))
+                else v)
+            for k, v in extracted.items()
         }
+        log.info("✓ %-30s  → %s", tool_name, summary)
 
-    # ── Extract plan data from raw tool results ───────────────────────────────
-    # Use raw_results (not msg.content strings) so _parse() handles list/dict correctly.
-    cap_parsed   = _parse(raw_results.get("GetWarehouseCapacity", {}))
-    route_parsed = _parse(raw_results.get("OptimizeRoute", {}))
-    carr_parsed  = _parse(raw_results.get("GetAvailableCarriers", {}))
-    quote_parsed = _parse(raw_results.get("GetCarrierQuote", {}))
-
-    log.info("v4 cap_parsed keys=%s", list(cap_parsed.keys()))
-
-    # Handle both {data: {warehouse: ...}} and direct {warehouse: ...} shapes
-    cap_data   = cap_parsed.get("data", cap_parsed)
-    route_data = route_parsed.get("data", route_parsed)
-    carr_data  = carr_parsed.get("data", carr_parsed)
-    quote_data = quote_parsed.get("data", quote_parsed)
-
-    warehouse = cap_data.get("warehouse")
-    if not warehouse:
-        # Surface the actual response so the error is actionable
-        gql_errors = cap_parsed.get("errors") or cap_data.get("errors")
-        detail = f"GraphQL errors: {gql_errors}" if gql_errors else f"cap_data keys={list(cap_data.keys())}"
-        return {
-            "messages": messages,
-            "status": "error",
-            "error": f"GetWarehouseCapacity returned no warehouse. {detail}",
-        }
-
-    capacity      = cap_data.get("warehouseCapacity", {})
-    origin_postal = warehouse.get("address", {}).get("postalCode", "")
-    if not origin_postal:
-        return {
-            "messages": messages,
-            "status": "error",
-            "error": "Warehouse address / postal code missing from GetWarehouseCapacity result.",
-        }
-
-    route = route_data.get("optimizeRoute")
-    if not route:
-        return {
-            "messages": messages,
-            "status": "error",
-            "error": "OptimizeRoute returned no route data.",
-        }
-
-    raw_date      = route.get("estimatedDeliveryDate", "")
-    delivery_date = raw_date[:10] if raw_date else datetime.now(timezone.utc).strftime("%Y-%m-%d")
-
-    carriers = carr_data.get("availableCarriers", [])
-    if not carriers:
-        return {
-            "messages": messages,
-            "status": "error",
-            "error": "GetAvailableCarriers returned no carriers.",
-        }
-
-    best_carrier = max(carriers, key=lambda c: c.get("onTimeDeliveryRate", 0) if isinstance(c, dict) else 0)
-    # onTimeDeliveryRate may be nested under performance
-    if "performance" in best_carrier:
-        best_carrier_rate_key = lambda c: c.get("performance", {}).get("onTimeDeliveryRate", 0)
-        best_carrier = max(carriers, key=best_carrier_rate_key)
-
-    log.info("v4 llm_plan_node: best_carrier=%s", best_carrier.get("name") or best_carrier.get("id"))
-
-    quote = quote_data.get("carrierQuote")
-    if not quote:
-        return {
-            "messages": messages,
-            "status": "error",
-            "error": "GetCarrierQuote returned no quote data.",
-        }
-
-    service_level = "EXPRESS" if priority in ("EXPRESS", "OVERNIGHT", "SAME_DAY") else "STANDARD"
+    # ── Pack extracted context into a plan dict ───────────────────────────────
+    raw_date      = (ctx.get("route") or {}).get("estimatedDeliveryDate", "")
+    delivery_date = ctx.get("delivery_date") or (
+        raw_date[:10] if raw_date else datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    )
 
     plan = {
-        "warehouse":    warehouse,
-        "capacity":     capacity,
-        "origin_postal": origin_postal,
-        "route":        route,
+        "warehouse":     ctx["warehouse"],
+        "capacity":      ctx["capacity"],
+        "origin_postal": ctx["origin_postal"],
+        "route":         ctx["route"],
         "delivery_date": delivery_date,
-        "carriers":     carriers,
-        "best_carrier": best_carrier,
-        "quote":        quote,
-        "weight_kg":    weight_kg,
-        "volume_m3":    volume_m3,
+        "carriers":      ctx["carriers"],
+        "best_carrier":  ctx["best_carrier"],
+        "quote":         ctx["quote"],
+        "weight_kg":     weight_kg,
+        "volume_m3":     volume_m3,
         "service_level": service_level,
     }
 
-    log.info("v4 llm_plan_node: plan extracted — delivery=%s cost=%s", delivery_date, quote.get("totalCost"))
+    log.info("v4 llm_plan_node: plan ready — delivery=%s cost=%s",
+             delivery_date, (ctx.get("quote") or {}).get("totalCost"))
     return {"messages": messages, "plan": plan, "status": "llm_done", "error": None}
 
 
@@ -451,11 +533,11 @@ _checkpointer = MemorySaver()
 def _build_graph():
     g = StateGraph(V4State)
 
-    g.add_node("llm_plan_node",   llm_plan_node)
-    g.add_node("plan_gate",       plan_gate)
-    g.add_node("create_shipment", create_shipment)
-    g.add_node("dock_gate",       dock_gate)
-    g.add_node("book_dock",       book_dock)
+    g.add_node("llm_plan_node",    llm_plan_node)
+    g.add_node("plan_gate",        plan_gate)
+    g.add_node("create_shipment",  create_shipment)
+    g.add_node("dock_gate",        dock_gate)
+    g.add_node("book_dock",        book_dock)
 
     g.add_edge(START, "llm_plan_node")
     g.add_conditional_edges("llm_plan_node",   _after_llm_plan_node,   {"plan_gate": "plan_gate", END: END})
@@ -487,7 +569,7 @@ def _get_interrupt(snapshot) -> dict | None:
 
 async def start_plan(request: dict) -> dict:
     """
-    Phase 1 — llm_plan_node (LLM agentic loop over MCP read tools).
+    Phase 1 — llm_plan_node (LLM agentic loop + MCPToolStep extraction).
     Pauses at Gate 1 (plan_gate).
     Returns {"status": "needs_plan_confirmation", "threadId": ..., "plan": {...}}
          or {"status": "error", "threadId": ..., "error": "..."}

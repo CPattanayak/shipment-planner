@@ -1,0 +1,11 @@
+# Tool: assign_carrier
+# Links a carrier to a shipment record.
+mutation AssignCarrier($shipmentId: ID!, $carrierId: ID!) {
+  assignCarrier(shipmentId: $shipmentId, carrierId: $carrierId) {
+    id
+    trackingNumber
+    status
+    carrierId
+    updatedAt
+  }
+}

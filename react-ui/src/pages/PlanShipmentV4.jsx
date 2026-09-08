@@ -1,15 +1,16 @@
 /**
- * PlanShipmentV4 — LLM agentic loop over MCP read tools + direct GraphQL mutations
+ * PlanShipmentV4 — LLM agentic loop over MCP read tools + MCPToolStep extraction
  *
  * Architecture
  * ────────────
- *   llm_plan_node  LLM (ChatOpenAI) drives an agentic tool-use loop:
- *                    tool_call → GetWarehouseCapacity(id)
+ *   llm_plan_node  LLM (ChatOpenAI) drives the tool-use loop:
+ *                    tool_call → GetWarehouseCapacity(id)      ← LLM decides args
  *                    tool_call → OptimizeRoute(...)
  *                    tool_call → GetAvailableCarriers(...)
  *                    tool_call → GetCarrierQuote(...)
- *                  LLM decides order & args; prompt constrains to these 4 tools.
- *                  Structured plan extracted from ToolMessage results in state.
+ *                  After the loop, raw results are processed through
+ *                  MCPToolStep.extract() + validate() — same ✓ / ✗ log format as
+ *                  Hybrid.  Adding a new tool = new step class + add to _STEP_MAP.
  *   [Gate 1]       Human reviews full plan — Approve / Reject        interrupt()
  *   create_ship    CreateShipment + BookCarrier                     ← direct GraphQL
  *   [Gate 2]       Human reviews dock slot — Book / Skip             interrupt()
@@ -17,15 +18,14 @@
  *
  * vs Hybrid
  * ─────────
- *   Hybrid  Python code names each MCP tool explicitly; asyncio.gather() parallelism
- *           is visible in code; tool-chain passes state node → node.
- *   V4      LLM orchestrates the same 4 tools via its native tool-use loop;
- *           any MCP-exposing service (GitHub, Stripe, Slack, …) works without
- *           code changes — just add tools to the client and update the prompt.
+ *   Hybrid  PLANNING_STEPS list — Python executes each step deterministically.
+ *   V4      LLM decides order + args; MCPToolStep classes handle extraction only.
+ *           Any MCP service works without Python orchestration changes — just add
+ *           tools to bind_tools() and update the system prompt.
  *
  * Backend
  * ───────
- *   POST /api/v4/plan          Phase 1 (LLM tool loop)
+ *   POST /api/v4/plan          Phase 1 (LLM tool loop + MCPToolStep extraction)
  *   POST /api/v4/plan/confirm  Gate 1 resume
  *   POST /api/v4/dock/confirm  Gate 2 resume
  */
@@ -40,7 +40,7 @@ const PRIORITIES = ['STANDARD', 'EXPRESS', 'OVERNIGHT', 'SAME_DAY'];
 const COUNTRIES  = ['US', 'CA', 'GB', 'DE', 'FR', 'AU', 'IN', 'SG', 'JP', 'MX'];
 const EMPTY_ITEM = {
   sku: '', description: '', quantity: 1,
-  weight: 0, volume: 0, value: 0,
+  weight: 0.1, volume: 0.1, value: 0,
   hazardous: false, temperatureControlled: false, fragile: false,
 };
 
@@ -56,32 +56,40 @@ function ArchBanner() {
     <div className="rounded-xl border border-sky-200 dark:border-sky-800 bg-sky-50 dark:bg-sky-900/20 p-4 mb-6 text-sm space-y-3">
       <div className="flex items-center gap-2">
         <span className="text-lg">🤖</span>
-        <p className="font-semibold text-sky-900 dark:text-sky-200">V4 Agent — LLM-driven MCP reads + direct GraphQL writes</p>
+        <p className="font-semibold text-sky-900 dark:text-sky-200">V4 Agent — LLM tool-use loop + MCPToolStep extraction + direct GraphQL writes</p>
       </div>
 
       {/* Flow diagram */}
       <div className="font-mono text-xs text-sky-800 dark:text-sky-300 space-y-0.5 leading-5">
         <div>
           <span className="bg-sky-200 dark:bg-sky-800 px-1.5 py-0.5 rounded font-semibold">llm_plan_node</span>
-          {' '}<span className="text-gray-400">LLM tool-use loop:</span>
+          {' '}<span className="text-gray-400">LLM tool-use loop · asyncio.gather() per round:</span>
         </div>
-        <div className="pl-4">
-          tool_call → <span className="text-amber-700 dark:text-amber-400">GetWarehouseCapacity</span>
-          {' '}<span className="text-gray-400">→ result stored in messages</span>
+        <div className="pl-4 flex items-start gap-1">
+          <span className="text-gray-400 shrink-0">R1 ∥</span>
+          <span>
+            <span className="text-amber-700 dark:text-amber-400">GetWarehouseCapacity</span>
+            {' '}<span className="text-gray-400">+</span>{' '}
+            <span className="text-amber-700 dark:text-amber-400">OptimizeRoute</span>
+            {' '}<span className="text-gray-400">(independent — LLM emits both at once)</span>
+          </span>
         </div>
-        <div className="pl-4">
-          tool_call → <span className="text-amber-700 dark:text-amber-400">OptimizeRoute</span>
-          {' '}<span className="text-gray-400">→ delivery date, distance</span>
+        <div className="pl-4 flex items-start gap-1">
+          <span className="text-gray-400 shrink-0">R2 →</span>
+          <span>
+            <span className="text-amber-700 dark:text-amber-400">GetAvailableCarriers</span>
+            {' '}<span className="text-gray-400">(needs origin_postal from R1)</span>
+          </span>
         </div>
-        <div className="pl-4">
-          tool_call → <span className="text-amber-700 dark:text-amber-400">GetAvailableCarriers</span>
-          {' '}<span className="text-gray-400">→ picks best by onTimeDeliveryRate</span>
+        <div className="pl-4 flex items-start gap-1">
+          <span className="text-gray-400 shrink-0">R3 →</span>
+          <span>
+            <span className="text-amber-700 dark:text-amber-400">GetCarrierQuote</span>
+            {' '}<span className="text-gray-400">(needs best carrier from R2)</span>
+          </span>
         </div>
-        <div className="pl-4">
-          tool_call → <span className="text-amber-700 dark:text-amber-400">GetCarrierQuote</span>
-          {' '}<span className="text-gray-400">→ final cost breakdown</span>
-        </div>
-        <div className="pl-4 text-gray-400">↓ plan extracted from ToolMessage history → interrupt()</div>
+        <div className="pl-4 text-gray-400">↓ each result → MCPToolStep.extract() + validate() → ToolContext</div>
+        <div className="pl-4 text-gray-400">↓ plan packed from ToolContext → interrupt()</div>
         <div><span className="bg-blue-200 dark:bg-blue-800 px-1.5 py-0.5 rounded font-semibold">Gate 1</span> Human reviews plan</div>
         <div className="pl-4 text-gray-400">↓ Command(resume=True)</div>
         <div><span className="bg-violet-200 dark:bg-violet-800 px-1.5 py-0.5 rounded font-semibold">create_shipment</span> CreateShipment + BookCarrier <span className="text-gray-400">← direct GraphQL (MCP is read-only)</span></div>
@@ -94,11 +102,11 @@ function ArchBanner() {
       {/* Key concepts */}
       <div className="flex flex-wrap gap-2 pt-1">
         {[
-          ['LLM tool-use loop',  'LLM calls tools natively — no explicit Python orchestration'],
-          ['Any MCP server',     'Add GitHub/Stripe/Slack tools without code changes'],
+          ['LLM round batching',  'LLM emits R1 tools together; Python runs them with asyncio.gather()'],
+          ['_STEP_MAP extraction','MCPToolStep.extract()+validate() processes each raw result'],
+          ['Shared ✓/✗ logging', 'Same log format as Hybrid pipeline — easy comparison'],
+          ['interrupt()',         'Typed HITL pause — resumes with Command(resume=bool)'],
           ['Zero-mutation LLM',  'Writes bypass LLM — direct GraphQL, cheaper + reliable'],
-          ['interrupt()',        'Typed HITL pause — resumes with Command(resume=bool)'],
-          ['ToolMessage parse',  'Plan data extracted from LangChain message history'],
         ].map(([label, tip]) => (
           <span key={label} title={tip}
             className="px-2 py-0.5 rounded-full bg-sky-100 dark:bg-sky-800/60 text-sky-800 dark:text-sky-300 text-xs font-medium cursor-help border border-sky-200 dark:border-sky-700">
@@ -448,9 +456,9 @@ function ItemRow({ item, idx, onChange, onRemove, canRemove }) {
         <div><label className="form-label">Qty</label>
           <input className="form-input" type="number" min={1} value={item.quantity} onChange={inp('quantity', true)} /></div>
         <div><label className="form-label">Weight (kg)</label>
-          <input className="form-input" type="number" min={0} step={0.1} value={item.weight} onChange={inp('weight', true)} /></div>
+          <input className="form-input" type="number" min={0.001} step={0.1} value={item.weight} onChange={inp('weight', true)} /></div>
         <div><label className="form-label">Volume (m³)</label>
-          <input className="form-input" type="number" min={0} step={0.001} value={item.volume} onChange={inp('volume', true)} /></div>
+          <input className="form-input" type="number" min={0.001} step={0.001} value={item.volume} onChange={inp('volume', true)} /></div>
         <div><label className="form-label">Value (USD)</label>
           <input className="form-input" type="number" min={0} step={0.01} value={item.value} onChange={inp('value', true)} /></div>
       </div>
@@ -576,7 +584,7 @@ export default function PlanShipmentV4() {
 
   /* Loading states */
   const LOADING_MSG = {
-    planning:   'LLM calling MCP tools: GetWarehouseCapacity → OptimizeRoute → GetAvailableCarriers → GetCarrierQuote…',
+    planning:   'LLM tool-use loop: GetWarehouseCapacity → OptimizeRoute → GetAvailableCarriers → GetCarrierQuote…',
     creating:   'LangGraph: creating shipment and booking carrier (direct GraphQL)…',
     confirming: 'LangGraph: finalising dock slot booking (direct GraphQL)…',
   };
@@ -613,11 +621,46 @@ export default function PlanShipmentV4() {
   );
 
   if (stage === 'error') return (
-    <div className="max-w-lg mx-auto px-4 py-12 text-center space-y-4">
-      <span className="text-5xl">⚠️</span>
-      <p className="text-xl font-semibold text-gray-800 dark:text-gray-200">Error</p>
-      <p className="text-sm text-red-600 dark:text-red-400 break-words">{error}</p>
-      <button onClick={handleReset} className="btn-secondary">Try again</button>
+    <div className="max-w-xl mx-auto px-4 py-12">
+      <div className="rounded-2xl border border-red-200 dark:border-red-800 bg-red-50 dark:bg-red-900/20 p-6 space-y-4">
+        {/* Header */}
+        <div className="flex items-start gap-3">
+          <span className="text-2xl mt-0.5" aria-hidden="true">🚫</span>
+          <div>
+            <p className="text-base font-semibold text-red-800 dark:text-red-200">Planning failed</p>
+            <p className="text-xs text-red-500 dark:text-red-400 mt-0.5">No data was written to the database.</p>
+          </div>
+        </div>
+
+        {/* Clean error message */}
+        <div className="rounded-lg bg-white dark:bg-red-950/40 border border-red-100 dark:border-red-800 px-4 py-3">
+          <p className="text-sm text-red-700 dark:text-red-300 leading-relaxed break-words">{error}</p>
+        </div>
+
+        {/* Hint based on common error patterns */}
+        {/"weight"|"volume"/i.test(error) && (
+          <p className="text-xs text-red-600 dark:text-red-400">💡 <strong>Hint:</strong> Item weight and volume must be greater than 0. Check each item row.</p>
+        )}
+        {/route|destination|postal/i.test(error) && (
+          <p className="text-xs text-red-600 dark:text-red-400">💡 <strong>Hint:</strong> No shipping route has been configured for this destination. Ask an admin to add a route from your origin warehouse to this postal code.</p>
+        )}
+        {/carrier|quote/i.test(error) && (
+          <p className="text-xs text-red-600 dark:text-red-400">💡 <strong>Hint:</strong> No carriers are available for this route or weight. Try adjusting shipment details or check carrier configurations.</p>
+        )}
+        {/warehouse/i.test(error) && (
+          <p className="text-xs text-red-600 dark:text-red-400">💡 <strong>Hint:</strong> The selected warehouse could not be found. Please choose a valid origin warehouse.</p>
+        )}
+        {/service not found|containers/i.test(error) && (
+          <p className="text-xs text-red-600 dark:text-red-400">💡 <strong>Hint:</strong> One or more backend services are not responding. Run <code className="bg-red-100 dark:bg-red-900 px-1 rounded">docker compose up</code> and try again.</p>
+        )}
+
+        {/* Actions */}
+        <div className="flex gap-3 pt-1">
+          <button onClick={handleReset} className="btn-primary">
+            Try again
+          </button>
+        </div>
+      </div>
     </div>
   );
 

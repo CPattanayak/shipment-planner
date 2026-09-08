@@ -1,0 +1,41 @@
+# Apollo Router configuration
+# Docs: https://www.apollographql.com/docs/router/configuration/overview
+
+supergraph:
+  listen: 0.0.0.0:4000
+  path: /graphql
+
+# ── CORS ──────────────────────────────────────────────────────────────────────
+cors:
+  allow_any_origin: true
+  allow_headers:
+    - Content-Type
+    - Authorization
+    - Apollo-Require-Preflight
+
+# ── Subgraph URLs ─────────────────────────────────────────────────────────────
+# Override per environment via environment variables or docker-compose
+override_subgraph_url:
+  shipment:  http://shipment-service:8081/graphql
+  route:     http://route-service:8082/graphql
+  carrier:   http://carrier-service:8083/graphql
+  warehouse: http://warehouse-service:8084/graphql
+
+# ── Health check ──────────────────────────────────────────────────────────────
+health_check:
+  listen: 0.0.0.0:8088
+  enabled: true
+
+# ── Sandbox ───────────────────────────────────────────────────────────────────
+sandbox:
+  enabled: true
+
+# ── Telemetry ─────────────────────────────────────────────────────────────────
+telemetry:
+  instrumentation:
+    spans:
+      mode: spec_compliant
+  exporters:
+    tracing:
+      common:
+        service_name: shipment-planner-router

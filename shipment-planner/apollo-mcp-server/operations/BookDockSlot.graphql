@@ -1,0 +1,33 @@
+# Tool: book_dock_slot
+# Reserves a specific dock slot for a shipment pickup or delivery.
+mutation BookDockSlot(
+  $warehouseId: ID!
+  $dockNumber: Int!
+  $date: String!
+  $startTime: String!
+  $endTime: String!
+  $shipmentId: ID!
+  $type: DockSlotType!
+) {
+  bookDockSlot(
+    input: {
+      warehouseId: $warehouseId
+      dockNumber: $dockNumber
+      date: $date
+      startTime: $startTime
+      endTime: $endTime
+      shipmentId: $shipmentId
+      type: $type
+    }
+  ) {
+    id
+    warehouseId
+    dockNumber
+    date
+    startTime
+    endTime
+    shipmentId
+    type
+    status
+  }
+}

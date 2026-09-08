@@ -100,7 +100,7 @@ export default function Layout({ children }) {
           }`}>
             {isPlanV1     ? '📖 V1 Study Mode — LangGraph ReAct Agent · MCP Tools · Per-mutation HITL interrupt()'
             : isPlanHybrid ? '📖 Hybrid Study Mode — Explicit MCP Nodes · asyncio.gather() · Tool chain · Two-gate HITL'
-            : isPlanV4    ? '📖 V4 Study Mode — LLM agentic loop over MCP reads · Direct GraphQL mutations · Two-gate HITL'
+            : isPlanV4    ? '🤖 V4 Study Mode — LLM parallel rounds · asyncio.gather() · MCPToolStep extraction · Two-gate HITL'
             :                '📖 V3 Study Mode — LangGraph StateGraph · Apollo Supergraph fan-out · Two-gate HITL interrupt()'}
           </div>
         )}

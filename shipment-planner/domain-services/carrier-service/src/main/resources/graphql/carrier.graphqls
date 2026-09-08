@@ -1,0 +1,102 @@
+extend schema
+  @link(url: "https://specs.apollo.dev/federation/v2.3",
+        import: ["@key", "@shareable"])
+
+type Query {
+  carrier(id: ID!): Carrier
+  carriers(activeOnly: Boolean = true): [Carrier!]!
+  availableCarriers(input: AvailabilityInput!): [Carrier!]!
+  carrierQuote(input: QuoteInput!): CarrierQuote!
+}
+
+type Mutation {
+  createCarrier(input: CreateCarrierInput!): Carrier!
+  setCarrierActive(id: ID!, active: Boolean!): Carrier!
+  bookCarrier(input: BookingInput!): CarrierBooking!
+}
+
+type Carrier @key(fields: "id") {
+  id: ID!
+  name: String!
+  code: String!
+  active: Boolean!
+  supportedModes: [String!]!
+  serviceAreas: [String!]!
+  capabilities: CarrierCapabilities!
+  performance: CarrierPerformance!
+  contactEmail: String
+}
+
+type CarrierCapabilities @shareable {
+  maxWeightKg: Float!
+  maxVolumeM3: Float!
+  hazardousAllowed: Boolean!
+  temperatureControlled: Boolean!
+  expressAvailable: Boolean!
+  overnightAvailable: Boolean!
+  sameDayAvailable: Boolean!
+  trackingAvailable: Boolean!
+}
+
+type CarrierPerformance @shareable {
+  onTimeDeliveryRate: Float!
+  averageDelayHours: Float!
+  damageRate: Float!
+  customerSatisfaction: Float!
+  totalShipments: Int!
+}
+
+type CarrierQuote {
+  carrierId: ID!
+  carrierName: String!
+  baseRate: Float!
+  fuelSurcharge: Float!
+  handlingFee: Float!
+  totalCost: Float!
+  transitDays: Int!
+  serviceLevel: String!
+  validUntil: String!
+}
+
+type CarrierBooking {
+  bookingId: ID!
+  carrierId: ID!
+  shipmentId: ID!
+  confirmedAt: String!
+  pickupWindow: String!
+  estimatedDelivery: String!
+  trackingNumber: String!
+}
+
+input AvailabilityInput {
+  originPostalCode: String!
+  destinationPostalCode: String!
+  weightKg: Float!
+  hasHazardous: Boolean!
+  requiresTemperatureControl: Boolean!
+  serviceLevel: String!
+}
+
+input QuoteInput {
+  carrierId: ID!
+  originPostalCode: String!
+  destinationPostalCode: String!
+  weightKg: Float!
+  volumeM3: Float!
+  serviceLevel: String!
+}
+
+input CreateCarrierInput {
+  name: String!
+  code: String!
+  contactEmail: String
+  supportedModes: [String!]!
+  serviceAreas: [String!]!
+}
+
+input BookingInput {
+  carrierId: ID!
+  shipmentId: ID!
+  serviceLevel: String!
+  requestedPickupDate: String!
+}

@@ -1,0 +1,26 @@
+# Rover supergraph composition config
+# Usage: rover supergraph compose --config supergraph.yaml > supergraph.graphql
+# Docs: https://www.apollographql.com/docs/rover/commands/supergraphs
+
+federation_version: =2.3.0
+
+subgraphs:
+  shipment:
+    routing_url: http://shipment-service:8081/graphql
+    schema:
+      subgraph_url: http://localhost:8081/graphql
+
+  route:
+    routing_url: http://route-service:8082/graphql
+    schema:
+      subgraph_url: http://localhost:8082/graphql
+
+  carrier:
+    routing_url: http://carrier-service:8083/graphql
+    schema:
+      subgraph_url: http://localhost:8083/graphql
+
+  warehouse:
+    routing_url: http://warehouse-service:8084/graphql
+    schema:
+      subgraph_url: http://localhost:8084/graphql

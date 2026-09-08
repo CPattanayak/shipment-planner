@@ -46,15 +46,37 @@ import httpx
 # ── GraphQL helpers ───────────────────────────────────────────────────────────
 
 async def _gql(query: str, variables: dict) -> dict:
-    """Execute one GraphQL operation against the Apollo Router."""
+    """Execute one GraphQL operation against the Apollo Router.
+
+    Always parses the response body before checking the HTTP status so that
+    Apollo Router's GraphQL error messages (returned even on 400 responses)
+    are surfaced as clean ValueError strings instead of raw httpx exceptions.
+    """
     async with httpx.AsyncClient(timeout=30) as c:
-        resp = await c.post(
-            GRAPHQL_ENDPOINT,
-            json={"query": query, "variables": variables},
-            headers={"Content-Type": "application/json"},
-        )
-        resp.raise_for_status()
-        return resp.json()
+        try:
+            resp = await c.post(
+                GRAPHQL_ENDPOINT,
+                json={"query": query, "variables": variables},
+                headers={"Content-Type": "application/json"},
+            )
+        except httpx.RequestError as exc:
+            raise ValueError(f"Cannot reach GraphQL service ({exc.__class__.__name__})") from exc
+
+        # Parse JSON body regardless of HTTP status — Apollo Router embeds
+        # structured errors in the body even for 4xx responses.
+        try:
+            body = resp.json()
+        except Exception:
+            raise ValueError(f"GraphQL service returned {resp.status_code} (non-JSON body)")
+
+        if not resp.is_success:
+            if isinstance(body.get("errors"), list) and body["errors"]:
+                msg = body["errors"][0].get("message", f"GraphQL error ({resp.status_code})")
+            else:
+                msg = f"GraphQL service returned {resp.status_code}"
+            raise ValueError(msg)
+
+        return body
 
 
 def _check(result: dict, label: str) -> dict:

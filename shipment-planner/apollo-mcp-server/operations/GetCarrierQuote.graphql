@@ -1,0 +1,31 @@
+# Tool: get_carrier_quote
+# Gets a binding price quote from a specific carrier for a shipment.
+query GetCarrierQuote(
+  $carrierId: ID!
+  $originPostalCode: String!
+  $destinationPostalCode: String!
+  $weightKg: Float!
+  $volumeM3: Float!
+  $serviceLevel: String!
+) {
+  carrierQuote(
+    input: {
+      carrierId: $carrierId
+      originPostalCode: $originPostalCode
+      destinationPostalCode: $destinationPostalCode
+      weightKg: $weightKg
+      volumeM3: $volumeM3
+      serviceLevel: $serviceLevel
+    }
+  ) {
+    carrierId
+    carrierName
+    baseRate
+    fuelSurcharge
+    handlingFee
+    totalCost
+    transitDays
+    serviceLevel
+    validUntil
+  }
+}

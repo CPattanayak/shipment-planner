@@ -1,5 +1,7 @@
 package com.shipmentplanner.service;
 
+import com.shipmentplanner.exception.BusinessException;
+import com.shipmentplanner.exception.BusinessException.ErrorType;
 import com.shipmentplanner.model.DockSlot;
 import com.shipmentplanner.model.Warehouse;
 import com.shipmentplanner.repository.DockSlotRepository;
@@ -33,7 +35,7 @@ public class WarehouseService {
     @Transactional(readOnly = true)
     public Warehouse getById(String id) {
         return warehouseRepository.findById(id)
-            .orElseThrow(() -> new RuntimeException("Warehouse not found: " + id));
+            .orElseThrow(() -> new BusinessException(ErrorType.NOT_FOUND, "Warehouse not found: " + id));
     }
 
     @Transactional(readOnly = true)
@@ -151,7 +153,7 @@ public class WarehouseService {
 
     public DockSlot releaseDockSlot(String slotId) {
         DockSlot slot = dockSlotRepository.findById(slotId)
-            .orElseThrow(() -> new RuntimeException("Dock slot not found: " + slotId));
+            .orElseThrow(() -> new BusinessException(ErrorType.NOT_FOUND, "Dock slot not found: " + slotId));
         slot.setStatus("AVAILABLE");
         slot.setShipmentId(null);
         return dockSlotRepository.save(slot);

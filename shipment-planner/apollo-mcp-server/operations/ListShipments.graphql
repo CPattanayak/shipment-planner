@@ -1,0 +1,28 @@
+# Tool: list_shipments
+# Lists shipments with optional status filter and pagination.
+query ListShipments($status: ShipmentStatus, $limit: Int = 20, $offset: Int = 0) {
+  shipments(status: $status, limit: $limit, offset: $offset) {
+    id
+    trackingNumber
+    status
+    priority
+    originWarehouseId
+    carrierId
+    routeId
+    totalWeight
+    totalVolume
+    totalValue
+    estimatedDelivery
+    actualDelivery
+    scheduledPickup
+    createdAt
+    updatedAt
+    destinationAddress {
+      street
+      city
+      state
+      country
+      postalCode
+    }
+  }
+}

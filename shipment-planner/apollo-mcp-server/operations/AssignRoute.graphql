@@ -1,0 +1,12 @@
+# Tool: assign_route
+# Links an optimised route to a shipment record.
+mutation AssignRoute($shipmentId: ID!, $routeId: ID!) {
+  assignRoute(shipmentId: $shipmentId, routeId: $routeId) {
+    id
+    trackingNumber
+    status
+    routeId
+    estimatedDelivery
+    updatedAt
+  }
+}

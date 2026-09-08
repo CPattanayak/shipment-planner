@@ -1,0 +1,46 @@
+# Tool: get_available_carriers
+# Returns carriers that can handle the shipment profile (weight, hazmat, temp, service level).
+query GetAvailableCarriers(
+  $originPostalCode: String!
+  $destinationPostalCode: String!
+  $weightKg: Float!
+  $hasHazardous: Boolean!
+  $requiresTemperatureControl: Boolean!
+  $serviceLevel: String!
+) {
+  availableCarriers(
+    input: {
+      originPostalCode: $originPostalCode
+      destinationPostalCode: $destinationPostalCode
+      weightKg: $weightKg
+      hasHazardous: $hasHazardous
+      requiresTemperatureControl: $requiresTemperatureControl
+      serviceLevel: $serviceLevel
+    }
+  ) {
+    id
+    name
+    code
+    active
+    supportedModes
+    serviceAreas
+    capabilities {
+      maxWeightKg
+      maxVolumeM3
+      hazardousAllowed
+      temperatureControlled
+      expressAvailable
+      overnightAvailable
+      sameDayAvailable
+      trackingAvailable
+    }
+    performance {
+      onTimeDeliveryRate
+      averageDelayHours
+      damageRate
+      customerSatisfaction
+      totalShipments
+    }
+    contactEmail
+  }
+}

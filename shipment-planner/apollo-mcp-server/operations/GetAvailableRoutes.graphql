@@ -1,0 +1,35 @@
+# Tool: get_available_routes
+# Lists all active routes from a given warehouse to a destination postal code.
+query GetAvailableRoutes($originWarehouseId: ID!, $destinationPostalCode: String!) {
+  availableRoutes(
+    originWarehouseId: $originWarehouseId
+    destinationPostalCode: $destinationPostalCode
+  ) {
+    id
+    name
+    originWarehouseId
+    destinationPostalCode
+    status
+    transportMode
+    totalDistanceKm
+    estimatedDurationHours
+    costPerKg
+    maxWeightKg
+    maxVolumeM3
+    carrierIds
+    restrictions {
+      hazardousAllowed
+      temperatureControlled
+      maxItemValueUsd
+      countries
+    }
+    waypoints {
+      sequence
+      location
+      lat
+      lng
+      estimatedArrival
+      type
+    }
+  }
+}

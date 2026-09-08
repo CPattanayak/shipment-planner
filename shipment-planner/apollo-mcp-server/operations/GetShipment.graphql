@@ -1,0 +1,47 @@
+# Tool: get_shipment
+# Retrieves a single shipment with full details including items and status history.
+query GetShipment($id: ID!) {
+  shipment(id: $id) {
+    id
+    trackingNumber
+    status
+    priority
+    originWarehouseId
+    carrierId
+    routeId
+    totalWeight
+    totalVolume
+    totalValue
+    estimatedDelivery
+    actualDelivery
+    scheduledPickup
+    specialInstructions
+    createdAt
+    updatedAt
+    destinationAddress {
+      street
+      city
+      state
+      country
+      postalCode
+    }
+    items {
+      id
+      sku
+      description
+      quantity
+      weight
+      volume
+      value
+      hazardous
+      temperatureControlled
+      fragile
+    }
+    statusHistory {
+      status
+      timestamp
+      location
+      notes
+    }
+  }
+}

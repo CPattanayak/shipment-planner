@@ -1,0 +1,15 @@
+# Tool: get_available_dock_slots
+# Returns all available dock slots at a warehouse on a given date.
+query GetAvailableDockSlots($warehouseId: ID!, $date: String!) {
+  availableDockSlots(warehouseId: $warehouseId, date: $date) {
+    id
+    warehouseId
+    dockNumber
+    date
+    startTime
+    endTime
+    shipmentId
+    type
+    status
+  }
+}

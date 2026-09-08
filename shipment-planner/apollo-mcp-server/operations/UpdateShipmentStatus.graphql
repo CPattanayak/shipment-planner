@@ -1,0 +1,16 @@
+# Tool: update_shipment_status
+# Updates the status of a shipment (e.g. IN_TRANSIT, DELIVERED, EXCEPTION).
+mutation UpdateShipmentStatus($id: ID!, $status: ShipmentStatus!, $notes: String) {
+  updateShipmentStatus(id: $id, status: $status, notes: $notes) {
+    id
+    trackingNumber
+    status
+    updatedAt
+    statusHistory {
+      status
+      timestamp
+      location
+      notes
+    }
+  }
+}
