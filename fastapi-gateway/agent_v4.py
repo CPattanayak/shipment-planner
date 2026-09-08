@@ -293,15 +293,23 @@ async def llm_plan_node(state: V4State) -> dict:
             log.info("↺ reused cached result for %s", name)
 
         # Execute new tool calls in parallel
+        MAX_RETRIES = 3
+        RETRY_DELAY = 1.0
         if new_calls:
-            try:
-                results = await asyncio.gather(*[
-                    tool_map[name].ainvoke(tc["args"]) for name, tc in new_calls.items()
-                ])
-            except Exception as exc:
-                clean = _clean_error(exc)
-                log.error("tool gather raised: %s", clean)
-                return {"messages": messages, "status": "error", "error": clean}
+            results = None
+            for attempt in range(1, MAX_RETRIES + 1):
+                try:
+                    results = await asyncio.gather(*[
+                        tool_map[name].ainvoke(tc["args"]) for name, tc in new_calls.items()
+                    ])
+                    break  # success → exit retry loop
+                except Exception as exc:
+                    clean = _clean_error(exc)
+                    log.error("tool gather attempt %d/%d failed: %s", attempt, MAX_RETRIES, clean)
+                    if attempt < MAX_RETRIES:
+                        await asyncio.sleep(RETRY_DELAY)  # backoff before retry
+                    else:
+                        return {"messages": messages, "status": "error", "error": clean}
 
             for (name, tc), result in zip(new_calls.items(), results):
                 raw_results[name] = result
