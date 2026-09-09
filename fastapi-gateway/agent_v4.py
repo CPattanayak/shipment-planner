@@ -3,7 +3,7 @@ Shipment Planning — V4 (LangGraph StateGraph + LLM agentic loop over MCP read 
 
 Architecture
 ────────────
-  llm_plan_node   LLM (ChatOpenAI via OpenRouter) with all four MCP read tools
+  llm_plan_node   LLM (OpenRouter OR Mistral AI) with all four MCP read tools
                   bound.  The LLM runs a native tool-use loop and decides:
                     • which tools to call
                     • in what order
@@ -22,6 +22,19 @@ Architecture
   dock_gate       HLT interrupt — Gate 2: human reviews dock slot.
 
   book_dock       BookDockSlot (direct GraphQL mutation).
+
+LLM Providers
+─────────────
+  Set LLM_PROVIDER env var to choose:
+
+    LLM_PROVIDER=openrouter  (default)
+      Uses ChatOpenAI pointed at OpenRouter.
+      Requires: OPENROUTER_API_KEY, optional OPENROUTER_MODEL / OPENROUTER_BASE_URL.
+
+    LLM_PROVIDER=mistral
+      Uses ChatMistralAI (langchain-mistralai).
+      Requires: MISTRAL_API_KEY, optional MISTRAL_MODEL (default mistral-large-latest).
+      Recommended models for tool-use: mistral-large-latest, mistral-medium-latest.
 
 vs Hybrid
 ─────────
@@ -69,10 +82,14 @@ from agent_v3 import (
     _M_BOOK_DOCK_SLOT,
 )
 from config import (
+    LLM_PROVIDER,
     MCP_SERVER_URL,
+    PROMPT_MCP_SERVER_URL,
     OPENROUTER_API_KEY,
     OPENROUTER_BASE_URL,
     OPENROUTER_MODEL,
+    MISTRAL_API_KEY,
+    MISTRAL_MODEL,
 )
 from mcp_pipeline import (
     ToolContext,
@@ -85,6 +102,102 @@ from mcp_pipeline import (
 
 log = logging.getLogger(__name__)
 
+
+# ── LLM factory ───────────────────────────────────────────────────────────────
+
+def _build_llm():
+    """
+    Return the configured LLM with temperature=0, ready for bind_tools().
+
+    Provider is selected by the LLM_PROVIDER env var:
+      "openrouter" (default) — ChatOpenAI → OpenRouter
+      "mistral"              — ChatMistralAI → Mistral AI
+    """
+    if LLM_PROVIDER == "mistral":
+        try:
+            from langchain_mistralai import ChatMistralAI
+        except ImportError as exc:
+            raise RuntimeError(
+                "langchain-mistralai is not installed. "
+                "Run: pip install langchain-mistralai>=0.2.0"
+            ) from exc
+
+        if not MISTRAL_API_KEY:
+            raise RuntimeError(
+                "LLM_PROVIDER=mistral but MISTRAL_API_KEY is not set. "
+                "Add it to your .env file."
+            )
+
+        log.info("v4 LLM provider=mistral  model=%s", MISTRAL_MODEL)
+        return ChatMistralAI(
+            model=MISTRAL_MODEL,
+            mistral_api_key=MISTRAL_API_KEY,
+            temperature=0,
+        )
+
+    # Default: OpenRouter (OpenAI-compatible)
+    if not OPENROUTER_API_KEY:
+        raise RuntimeError(
+            "LLM_PROVIDER=openrouter but OPENROUTER_API_KEY is not set. "
+            "Add it to your .env file."
+        )
+
+    log.info("v4 LLM provider=openrouter  model=%s", OPENROUTER_MODEL)
+    return ChatOpenAI(
+        model=OPENROUTER_MODEL,
+        api_key=OPENROUTER_API_KEY,
+        base_url=OPENROUTER_BASE_URL,
+        temperature=0,
+    )
+
+
+# ── Prompt resolver ───────────────────────────────────────────────────────────
+
+async def _fetch_system_prompt() -> str:
+    """
+    Fetch the active planning system prompt from the fastapi-mcp prompt server.
+
+    The prompt server (fastapi-mcp/prompt_server.py) exposes versioned prompts
+    as MCP resources.  Fetching at runtime means the prompt can be updated by
+    restarting the prompt server — no gateway redeploy required.
+
+    Versioning flow:
+      1. Add a new file:  fastapi-mcp/prompts/planning_v2.txt
+      2. Set env var:     ACTIVE_PLANNING_PROMPT=planning_v2  in the prompt server
+      3. Restart prompt server — all future planning runs use the new prompt
+
+    Falls back to the hard-coded SYSTEM_PROMPT constant if:
+      • PROMPT_MCP_SERVER_URL is empty/unset
+      • The prompt server is unreachable
+      • The resource returns empty content
+    """
+    if not PROMPT_MCP_SERVER_URL:
+        log.info("v4 prompt: PROMPT_MCP_SERVER_URL not set — using built-in")
+        return SYSTEM_PROMPT
+
+    try:
+        from mcp import ClientSession
+        from mcp.client.streamable_http import streamablehttp_client
+
+        async with streamablehttp_client(PROMPT_MCP_SERVER_URL) as (read, write, _):
+            async with ClientSession(read, write) as session:
+                await session.initialize()
+                result = await session.read_resource("prompt://planning/current")
+                if result.contents:
+                    text = getattr(result.contents[0], "text", None) or ""
+                    text = text.strip()
+                    if text:
+                        log.info("v4 prompt: fetched from %s (%d chars)",
+                                 PROMPT_MCP_SERVER_URL, len(text))
+                        return text
+                raise RuntimeError("resource returned empty content")
+
+    except Exception as exc:
+        log.warning("v4 prompt: fetch failed (%s) — falling back to built-in prompt", exc)
+        return SYSTEM_PROMPT
+
+
+# ── Error helpers ─────────────────────────────────────────────────────────────
 
 def _clean_error(exc_or_str) -> str:
     """
@@ -144,9 +257,20 @@ def _clean_error(exc_or_str) -> str:
     return s
 
 
-# ── Constants ─────────────────────────────────────────────────────────────────
+# ── Step map — single source of truth for which tools V4 uses ─────────────────
+#
+# Adding a new read tool = add one entry here.
+# REQUIRED_TOOLS and the LLM tool-filter both derive from this dict
+# automatically — no other constant needs updating.
 
-# READ_TOOLS = {"GetWarehouseCapacity", "OptimizeRoute", "GetAvailableCarriers", "GetCarrierQuote"}
+_STEP_MAP: dict[str, MCPToolStep] = {
+    "GetWarehouseCapacity":  GetWarehouseCapacityStep(),
+    "OptimizeRoute":         OptimizeRouteStep(),
+    "GetAvailableCarriers":  GetAvailableCarriersStep(),
+    "GetCarrierQuote":       GetCarrierQuoteStep(),
+}
+
+_MCP_CFG = {"shipment-planner": {"transport": "streamable_http", "url": MCP_SERVER_URL}}
 
 SYSTEM_PROMPT = (
     "You are a shipment planning agent. Call tools in exactly THREE rounds:\n\n"
@@ -168,17 +292,6 @@ SYSTEM_PROMPT = (
     "Do NOT call any other tools. Do NOT call mutations. "
     "Always emit Round 1 tools together in one response."
 )
-
-# Map each MCP tool name to the MCPToolStep that knows how to extract/validate it.
-# The LLM decides IF and WHEN to call each tool; the step handles result processing.
-_STEP_MAP: dict[str, MCPToolStep] = {
-    "GetWarehouseCapacity":  GetWarehouseCapacityStep(),
-    "OptimizeRoute":         OptimizeRouteStep(),
-    "GetAvailableCarriers":  GetAvailableCarriersStep(),
-    "GetCarrierQuote":       GetCarrierQuoteStep(),
-}
-
-_MCP_CFG = {"shipment-planner": {"transport": "streamable_http", "url": MCP_SERVER_URL}}
 
 
 # ── State ─────────────────────────────────────────────────────────────────────
@@ -207,10 +320,18 @@ class V4State(TypedDict):
 
 
 # ── LLM plan node ─────────────────────────────────────────────────────────────
+
 async def llm_plan_node(state: V4State) -> dict:
     """
-    Phase 1 — LLM agentic tool-use loop with deduplication.
-    Prevents duplicate tool calls while preserving parallel execution.
+    Phase 1 — LLM agentic tool-use loop with deduplication and retry.
+
+    Loop behaviour:
+      • Unknown tool names are filtered and skipped with a warning.
+      • Duplicate calls (tool already in raw_results) get the cached result
+        injected as a ToolMessage instead of a live network call — the LLM
+        receives the same data without paying the latency cost again.
+      • All new calls in a round are executed in parallel via asyncio.gather().
+      • Failed gathers are retried up to MAX_RETRIES times with exponential backoff.
     """
     req   = state["request"]
     dst   = req["destinationAddress"]
@@ -221,7 +342,11 @@ async def llm_plan_node(state: V4State) -> dict:
     priority  = req.get("priority", "STANDARD")
     service_level = "EXPRESS" if priority in ("EXPRESS", "OVERNIGHT", "SAME_DAY") else "STANDARD"
 
-    log.info("v4 llm_plan_node: wh=%s dest=%s %.1fkg", req["originWarehouseId"], dst["postalCode"], weight_kg)
+    log.info("v4 llm_plan_node: wh=%s dest=%s %.1fkg  provider=%s",
+             req["originWarehouseId"], dst["postalCode"], weight_kg, LLM_PROVIDER)
+
+    # ── Resolve system prompt (MCP server → built-in fallback) ───────────────
+    system_prompt = await _fetch_system_prompt()
 
     # ── Build MCP client and filter to read tools only ────────────────────────
     client    = MultiServerMCPClient(_MCP_CFG)
@@ -229,32 +354,30 @@ async def llm_plan_node(state: V4State) -> dict:
     tool_map  = {t.name: t for t in all_tools if t.name in _STEP_MAP}
     log.info("v4 llm_plan_node: read_tools=%s", list(tool_map.keys()))
 
-    # ── Bind tools to LLM ─────────────────────────────────────────────────────
-    llm = ChatOpenAI(
-        model=OPENROUTER_MODEL,
-        api_key=OPENROUTER_API_KEY,
-        base_url=OPENROUTER_BASE_URL,
-        temperature=0,
-    )
+    # ── Bind tools to LLM (provider-aware) ───────────────────────────────────
+    llm            = _build_llm()
     llm_with_tools = llm.bind_tools(list(tool_map.values()))
 
     request_payload = {
         **req,
         "_derived": {
-            "weightKg":    weight_kg,
-            "volumeM3":    volume_m3,
+            "weightKg":     weight_kg,
+            "volumeM3":     volume_m3,
             "serviceLevel": service_level,
         },
     }
 
     messages: list = [
-        SystemMessage(content=SYSTEM_PROMPT),
+        SystemMessage(content=system_prompt),
         HumanMessage(content=json.dumps(request_payload)),
     ]
 
     raw_results: dict = {}
 
-    # ── Agentic loop ─────────────────────────────────────────────────────────
+    # ── Agentic loop ──────────────────────────────────────────────────────────
+    MAX_RETRIES = 3
+    RETRY_DELAY = 1.0
+
     while True:
         response = await llm_with_tools.ainvoke(messages)
         messages.append(response)
@@ -263,16 +386,16 @@ async def llm_plan_node(state: V4State) -> dict:
             break
 
         # Filter to known read tools only
-        valid = [tc for tc in response.tool_calls if tc["name"] in tool_map]
+        valid   = [tc for tc in response.tool_calls if tc["name"] in tool_map]
         unknown = [tc["name"] for tc in response.tool_calls if tc["name"] not in tool_map]
         if unknown:
-            log.warning("LLM tried unknown tools %s, skipping", unknown)
+            log.warning("v4: LLM tried unknown tools %s — skipping", unknown)
 
         if not valid:
             continue
 
-        # Deduplication: split into new vs already-called (dicts keyed by tool name)
-        new_calls: dict[str, dict] = {}
+        # Split into new calls vs already-cached duplicates
+        new_calls:   dict[str, dict] = {}
         reuse_calls: dict[str, dict] = {}
         for tc in valid:
             if tc["name"] in raw_results:
@@ -284,30 +407,28 @@ async def llm_plan_node(state: V4State) -> dict:
                  [tc["name"] for tc in valid],
                  "  [parallel]" if len(valid) > 1 else "")
 
-        # Inject cached results for duplicates
+        # Inject cached results for duplicates — no network call needed
         for name, tc in reuse_calls.items():
-            cached = raw_results[name]
             messages.append(
-                ToolMessage(content=str(cached), tool_call_id=tc["id"], name=name)
+                ToolMessage(content=str(raw_results[name]), tool_call_id=tc["id"], name=name)
             )
             log.info("↺ reused cached result for %s", name)
 
-        # Execute new tool calls in parallel
-        MAX_RETRIES = 3
-        RETRY_DELAY = 1.0
+        # Execute new calls in parallel with retry
         if new_calls:
             results = None
             for attempt in range(1, MAX_RETRIES + 1):
                 try:
                     results = await asyncio.gather(*[
-                        tool_map[name].ainvoke(tc["args"]) for name, tc in new_calls.items()
+                        tool_map[name].ainvoke(tc["args"])
+                        for name, tc in new_calls.items()
                     ])
-                    break  # success → exit retry loop
+                    break
                 except Exception as exc:
                     clean = _clean_error(exc)
                     log.error("tool gather attempt %d/%d failed: %s", attempt, MAX_RETRIES, clean)
                     if attempt < MAX_RETRIES:
-                        await asyncio.sleep(RETRY_DELAY)  # backoff before retry
+                        await asyncio.sleep(RETRY_DELAY * attempt)  # linear backoff
                     else:
                         return {"messages": messages, "status": "error", "error": clean}
 
@@ -317,9 +438,9 @@ async def llm_plan_node(state: V4State) -> dict:
                     ToolMessage(content=str(result), tool_call_id=tc["id"], name=name)
                 )
 
-    log.info("tools_called=%s", list(raw_results.keys()))
+    log.info("v4 llm_plan_node: tools_called=%s", list(raw_results.keys()))
 
-    # ── Post-loop: extract + validate ─────────────────────────────────────────
+    # ── Post-loop: extract + validate via MCPToolStep classes ─────────────────
     ctx = ToolContext({
         "request":       req,
         "weight_kg":     weight_kg,
@@ -334,12 +455,13 @@ async def llm_plan_node(state: V4State) -> dict:
             log.error("✗ %-30s  %s", tool_name, err)
             return {"messages": messages, "status": "error", "error": err}
 
-        parsed  = MCPToolStep._parse(raw)
-        data    = parsed.get("data", parsed)
+        parsed = MCPToolStep._parse(raw)
+        data   = parsed.get("data", parsed)
 
+        # Surface GraphQL errors
         gql_errors = parsed.get("errors") or data.get("errors")
         if gql_errors:
-            first = gql_errors[0] if isinstance(gql_errors, list) else gql_errors
+            first   = gql_errors[0] if isinstance(gql_errors, list) else gql_errors
             raw_msg = first.get("message", str(gql_errors)) if isinstance(first, dict) else str(gql_errors)
             err = f"[{tool_name}] {raw_msg}"
             log.error("✗ %-30s  errors=%s", tool_name, gql_errors)
@@ -362,11 +484,12 @@ async def llm_plan_node(state: V4State) -> dict:
         summary = {
             k: (f"{str(v)[:60]}…" if isinstance(v, str) and len(v) > 60
                 else type(v).__name__ if not isinstance(v, (str, int, float, bool))
-            else v)
+                else v)
             for k, v in extracted.items()
         }
         log.info("✓ %-30s  → %s", tool_name, summary)
 
+    # ── Pack extracted context into plan dict ─────────────────────────────────
     raw_date      = (ctx.get("route") or {}).get("estimatedDeliveryDate", "")
     delivery_date = ctx.get("delivery_date") or (
         raw_date[:10] if raw_date else datetime.now(timezone.utc).strftime("%Y-%m-%d")
@@ -386,7 +509,7 @@ async def llm_plan_node(state: V4State) -> dict:
         "service_level": service_level,
     }
 
-    log.info("plan ready — delivery=%s cost=%s",
+    log.info("v4 llm_plan_node: plan ready — delivery=%s cost=%s",
              delivery_date, (ctx.get("quote") or {}).get("totalCost"))
     return {"messages": messages, "plan": plan, "status": "llm_done", "error": None}
 
@@ -544,11 +667,11 @@ _checkpointer = MemorySaver()
 def _build_graph():
     g = StateGraph(V4State)
 
-    g.add_node("llm_plan_node",    llm_plan_node)
-    g.add_node("plan_gate",        plan_gate)
-    g.add_node("create_shipment",  create_shipment)
-    g.add_node("dock_gate",        dock_gate)
-    g.add_node("book_dock",        book_dock)
+    g.add_node("llm_plan_node",   llm_plan_node)
+    g.add_node("plan_gate",       plan_gate)
+    g.add_node("create_shipment", create_shipment)
+    g.add_node("dock_gate",       dock_gate)
+    g.add_node("book_dock",       book_dock)
 
     g.add_edge(START, "llm_plan_node")
     g.add_conditional_edges("llm_plan_node",   _after_llm_plan_node,   {"plan_gate": "plan_gate", END: END})
@@ -626,10 +749,10 @@ async def confirm_plan(thread_id: str, approved: bool) -> dict:
         return {"status": "needs_dock_confirmation", "threadId": thread_id, "dockData": intr}
 
     return {
-        "status":    vals.get("status", "rejected_at_plan"),
-        "threadId":  thread_id,
-        "shipment":  vals.get("shipment"),
-        "booking":   vals.get("booking"),
+        "status":     vals.get("status", "rejected_at_plan"),
+        "threadId":   thread_id,
+        "shipment":   vals.get("shipment"),
+        "booking":    vals.get("booking"),
         "dockBooked": vals.get("dock_booked", False),
     }
 
@@ -646,11 +769,11 @@ async def confirm_dock(thread_id: str, approved: bool) -> dict:
     vals     = snapshot.values
 
     return {
-        "status":    "done",
-        "threadId":  thread_id,
-        "shipment":  vals.get("shipment"),
-        "booking":   vals.get("booking"),
+        "status":     "done",
+        "threadId":   thread_id,
+        "shipment":   vals.get("shipment"),
+        "booking":    vals.get("booking"),
         "dockBooked": vals.get("dock_booked", False),
-        "dockSlot":  vals.get("dock_slot"),
-        "error":     vals.get("error"),
+        "dockSlot":   vals.get("dock_slot"),
+        "error":      vals.get("error"),
     }

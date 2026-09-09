@@ -10,7 +10,8 @@ version: "3.9"
 #    warehouse-service– Spring Boot  :8084  GraphQL subgraph
 #    apollo-router    – Federation router :4000
 #    apollo-mcp-server– Official Apollo MCP Server :8090→8000
-#    fastapi-gateway  – LangGraph + OpenRouter FastAPI :8000
+#    fastapi-mcp      – Prompt MCP Server (versioned system prompts) :8091
+#    fastapi-gateway  – LangGraph + OpenRouter/Mistral FastAPI :8000
 #    react-ui         – Vite React + Apollo Client (nginx) :3000
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -154,7 +155,30 @@ services:
     depends_on:
       - apollo-router
 
-  # ── FastAPI Gateway (LangGraph + OpenRouter) ────────────────────────────────
+  # ── Prompt MCP Server (fastapi-mcp) ─────────────────────────────────────────
+  # Serves versioned planning system prompts as MCP resources.
+  # To change the active prompt:
+  #   1. Add fastapi-mcp/prompts/planning_v2.txt
+  #   2. Set ACTIVE_PLANNING_PROMPT=planning_v2 below (or in .env)
+  #   3. docker compose restart fastapi-mcp   (no gateway redeploy needed)
+  fastapi-mcp:
+    build:
+      context: ./fastapi-mcp
+      dockerfile: Dockerfile
+    container_name: sp-prompt-mcp
+    restart: unless-stopped
+    networks: [shipment-net]
+    ports:
+      - "8091:8091"
+    environment:
+      PORT: "8091"
+      # Override to switch prompt version without rebuilding
+      ACTIVE_PLANNING_PROMPT: ${ACTIVE_PLANNING_PROMPT:-planning_v1}
+    volumes:
+      # Mount prompts dir so you can add/edit .txt files without rebuilding
+      - ./fastapi-mcp/prompts:/app/prompts:ro
+
+  # ── FastAPI Gateway (LangGraph + OpenRouter / Mistral AI) ───────────────────
   fastapi-gateway:
     build:
       context: ./fastapi-gateway
@@ -170,14 +194,20 @@ services:
       # Points at the official Apollo MCP Server (streamable HTTP)
       MCP_SERVER_URL: http://apollo-mcp-server:8000/mcp
       GRAPHQL_ENDPOINT: http://apollo-router:4000/graphql
-      # OPENROUTER_API_KEY is read from .env
+      # Prompt MCP server — agent_v4 fetches system prompt from here at runtime.
+      # Set to empty string to always use the built-in hardcoded fallback.
+      PROMPT_MCP_SERVER_URL: http://fastapi-mcp:8091/mcp
+      # ── LLM provider: "openrouter" (default) or "mistral" ──────────────────
+      LLM_PROVIDER: ${LLM_PROVIDER:-openrouter}
+      # OpenRouter (used when LLM_PROVIDER=openrouter)
       OPENROUTER_BASE_URL: https://openrouter.ai/api/v1
-      # Default model – override in .env to use any OpenRouter-supported model
-      # openai/gpt-4o-mini → fast & cheap   openai/gpt-4o → stronger
-      # anthropic/claude-3.5-sonnet → best quality
       OPENROUTER_MODEL: ${OPENROUTER_MODEL:-openai/gpt-4o-mini}
+      # OPENROUTER_API_KEY is read from .env
+      # Mistral AI (used when LLM_PROVIDER=mistral)
+      # MISTRAL_API_KEY and MISTRAL_MODEL are read from .env
     depends_on:
       - apollo-mcp-server
+      - fastapi-mcp
 
   # ── React UI ────────────────────────────────────────────────────────────────
   # Nginx serves the built React app on :3000.
