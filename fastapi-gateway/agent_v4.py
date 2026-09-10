@@ -94,14 +94,7 @@ from config import (
     MISTRAL_API_KEY,
     MISTRAL_MODEL,
 )
-from mcp_pipeline import (
-    ToolContext,
-    MCPToolStep,
-    GetWarehouseCapacityStep,
-    OptimizeRouteStep,
-    GetAvailableCarriersStep,
-    GetCarrierQuoteStep,
-)
+from mcp_pipeline import ToolContext, MCPToolStep
 
 log = logging.getLogger(__name__)
 
@@ -255,14 +248,22 @@ def _clean_error(exc_or_str) -> str:
     return s
 
 
-# ── Step map — single source of truth for which tools V4 uses ─────────────────
+# ── Step map — auto-discovered from mcp_pipeline ──────────────────────────────
+# Convention: a class named `{ToolName}Step` that subclasses MCPToolStep is
+# automatically registered under the key `ToolName`.
+# To add a new tool: write `class MyNewToolStep(MCPToolStep)` in mcp_pipeline —
+# no changes needed here.
+
+import inspect
+import mcp_pipeline as _mcp_pipeline_mod
 
 _STEP_MAP: dict[str, MCPToolStep] = {
-    "GetWarehouseCapacity":  GetWarehouseCapacityStep(),
-    "OptimizeRoute":         OptimizeRouteStep(),
-    "GetAvailableCarriers":  GetAvailableCarriersStep(),
-    "GetCarrierQuote":       GetCarrierQuoteStep(),
+    name[: -len("Step")]: cls()
+    for name, cls in inspect.getmembers(_mcp_pipeline_mod, inspect.isclass)
+    if name.endswith("Step") and issubclass(cls, MCPToolStep) and cls is not MCPToolStep
 }
+
+log.debug("v4 _STEP_MAP auto-discovered: %s", list(_STEP_MAP.keys()))
 
 _MCP_CFG = {"shipment-planner": {"transport": "streamable_http", "url": MCP_SERVER_URL}}
 
