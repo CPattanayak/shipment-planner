@@ -65,6 +65,9 @@ from datetime import datetime, timezone
 from typing import Optional
 from typing_extensions import TypedDict
 
+from aiobreaker import CircuitBreaker, CircuitBreakerError
+from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
+
 import agent_hitl  # noqa: F401 — side-effect: patches MCP protocol version
 
 from langchain_mcp_adapters.client import MultiServerMCPClient
@@ -101,6 +104,29 @@ from mcp_pipeline import (
 )
 
 log = logging.getLogger(__name__)
+
+
+# ── Circuit breaker ───────────────────────────────────────────────────────────
+# Single breaker shared across all MCP tool calls.
+# Defaults: fail_max=5, timeout_duration=60s (half-open probe after 60s).
+# Override via CircuitBreaker(fail_max=3, timeout_duration=timedelta(seconds=30))
+
+breaker = CircuitBreaker()
+
+
+@retry(
+    retry=retry_if_exception_type(TimeoutError),
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(min=1, max=10),
+)
+async def call_tool(tool, args):
+    """
+    Call an MCP tool through the circuit breaker.
+    Automatically retries up to 3 times on TimeoutError with exponential
+    back-off (1 s → 2 s → 4 s, capped at 10 s).
+    CircuitBreakerError is never retried — it surfaces immediately.
+    """
+    return await breaker.call_async(tool.ainvoke, args)
 
 
 # ── LLM factory ───────────────────────────────────────────────────────────────
@@ -156,20 +182,7 @@ def _build_llm():
 async def _fetch_system_prompt() -> str:
     """
     Fetch the active planning system prompt from the fastapi-mcp prompt server.
-
-    The prompt server (fastapi-mcp/prompt_server.py) exposes versioned prompts
-    as MCP resources.  Fetching at runtime means the prompt can be updated by
-    restarting the prompt server — no gateway redeploy required.
-
-    Versioning flow:
-      1. Add a new file:  fastapi-mcp/prompts/planning_v2.txt
-      2. Set env var:     ACTIVE_PLANNING_PROMPT=planning_v2  in the prompt server
-      3. Restart prompt server — all future planning runs use the new prompt
-
-    Falls back to the hard-coded SYSTEM_PROMPT constant if:
-      • PROMPT_MCP_SERVER_URL is empty/unset
-      • The prompt server is unreachable
-      • The resource returns empty content
+    Falls back to the hard-coded SYSTEM_PROMPT if the server is unreachable.
     """
     if not PROMPT_MCP_SERVER_URL:
         log.info("v4 prompt: PROMPT_MCP_SERVER_URL not set — using built-in")
@@ -193,41 +206,27 @@ async def _fetch_system_prompt() -> str:
                 raise RuntimeError("resource returned empty content")
 
     except Exception as exc:
-        log.warning("v4 prompt: fetch failed (%s) — falling back to built-in prompt", exc)
+        log.warning("v4 prompt: fetch failed (%s) — using built-in fallback", exc)
         return SYSTEM_PROMPT
 
 
 # ── Error helpers ─────────────────────────────────────────────────────────────
 
 def _clean_error(exc_or_str) -> str:
-    """
-    Extract a clean, human-readable message from an exception or raw string that
-    may contain a JSON GraphQL error response, a FastAPI detail blob, or a
-    Python repr of an errors list.
-
-    Priority:
-      1. JSON body → errors[0].message
-      2. JSON body → detail (string)
-      3. Python-repr list → first element's 'message' key
-      4. Original string as-is
-    """
+    """Extract a clean, human-readable message from an exception or raw string."""
     s = str(exc_or_str)
 
-    # 1. Try to parse a JSON object inside the string
     match = re.search(r'\{.*\}', s, re.DOTALL)
     if match:
         try:
             data = json.loads(match.group())
-            # GraphQL errors array
             errors = data.get("errors")
             if isinstance(errors, list) and errors:
                 msg = errors[0].get("message") if isinstance(errors[0], dict) else None
                 if msg:
                     return msg
-            # FastAPI detail
             detail = data.get("detail")
             if isinstance(detail, str) and detail:
-                # detail might itself be a JSON string
                 try:
                     inner = json.loads(detail)
                     errors2 = inner.get("errors")
@@ -241,7 +240,6 @@ def _clean_error(exc_or_str) -> str:
         except Exception:
             pass
 
-    # 2. Python repr of a list, e.g. "[{'message': 'No route...', ...}]"
     match2 = re.search(r"\[.*\]", s, re.DOTALL)
     if match2:
         try:
@@ -258,10 +256,6 @@ def _clean_error(exc_or_str) -> str:
 
 
 # ── Step map — single source of truth for which tools V4 uses ─────────────────
-#
-# Adding a new read tool = add one entry here.
-# REQUIRED_TOOLS and the LLM tool-filter both derive from this dict
-# automatically — no other constant needs updating.
 
 _STEP_MAP: dict[str, MCPToolStep] = {
     "GetWarehouseCapacity":  GetWarehouseCapacityStep(),
@@ -297,41 +291,29 @@ SYSTEM_PROMPT = (
 # ── State ─────────────────────────────────────────────────────────────────────
 
 class V4State(TypedDict):
-    # conversation messages from the agentic loop
-    messages: list
-
-    # input
-    request: dict
-
-    # plan data — packed into a single dict after the LLM loop
-    plan: dict
-
-    # phase 2 — shipment + booking
-    shipment: dict
-    booking: dict
-
-    # phase 3 — dock slot
-    dock_slot: dict
+    messages:    list
+    request:     dict
+    plan:        dict
+    shipment:    dict
+    booking:     dict
+    dock_slot:   dict
     dock_booked: bool
-
-    # outcome
-    status: str
-    error: Optional[str]
+    status:      str
+    error:       Optional[str]
 
 
 # ── LLM plan node ─────────────────────────────────────────────────────────────
 
 async def llm_plan_node(state: V4State) -> dict:
     """
-    Phase 1 — LLM agentic tool-use loop with deduplication and retry.
+    Phase 1 — LLM agentic tool-use loop.
 
-    Loop behaviour:
-      • Unknown tool names are filtered and skipped with a warning.
-      • Duplicate calls (tool already in raw_results) get the cached result
-        injected as a ToolMessage instead of a live network call — the LLM
-        receives the same data without paying the latency cost again.
-      • All new calls in a round are executed in parallel via asyncio.gather().
-      • Failed gathers are retried up to MAX_RETRIES times with exponential backoff.
+      • Unknown tool names are filtered and skipped.
+      • Duplicate calls reuse cached results (no re-call).
+      • All new calls in a round run in parallel via asyncio.gather().
+      • Every tool call goes through call_tool():
+          – circuit breaker trips on repeated failures (CircuitBreakerError → immediate error)
+          – tenacity retries up to 3× on TimeoutError with exponential back-off
     """
     req   = state["request"]
     dst   = req["destinationAddress"]
@@ -345,38 +327,28 @@ async def llm_plan_node(state: V4State) -> dict:
     log.info("v4 llm_plan_node: wh=%s dest=%s %.1fkg  provider=%s",
              req["originWarehouseId"], dst["postalCode"], weight_kg, LLM_PROVIDER)
 
-    # ── Resolve system prompt (MCP server → built-in fallback) ───────────────
-    system_prompt = await _fetch_system_prompt()
-
-    # ── Build MCP client and filter to read tools only ────────────────────────
-    client    = MultiServerMCPClient(_MCP_CFG)
-    all_tools = await client.get_tools()
-    tool_map  = {t.name: t for t in all_tools if t.name in _STEP_MAP}
+    system_prompt  = await _fetch_system_prompt()
+    client         = MultiServerMCPClient(_MCP_CFG)
+    all_tools      = await client.get_tools()
+    tool_map       = {t.name: t for t in all_tools if t.name in _STEP_MAP}
     log.info("v4 llm_plan_node: read_tools=%s", list(tool_map.keys()))
 
-    # ── Bind tools to LLM (provider-aware) ───────────────────────────────────
     llm            = _build_llm()
     llm_with_tools = llm.bind_tools(list(tool_map.values()))
 
-    request_payload = {
-        **req,
-        "_derived": {
-            "weightKg":     weight_kg,
-            "volumeM3":     volume_m3,
-            "serviceLevel": service_level,
-        },
-    }
-
     messages: list = [
         SystemMessage(content=system_prompt),
-        HumanMessage(content=json.dumps(request_payload)),
+        HumanMessage(content=json.dumps({
+            **req,
+            "_derived": {
+                "weightKg":     weight_kg,
+                "volumeM3":     volume_m3,
+                "serviceLevel": service_level,
+            },
+        })),
     ]
 
     raw_results: dict = {}
-
-    # ── Agentic loop ──────────────────────────────────────────────────────────
-    MAX_RETRIES = 3
-    RETRY_DELAY = 1.0
 
     while True:
         response = await llm_with_tools.ainvoke(messages)
@@ -385,52 +357,44 @@ async def llm_plan_node(state: V4State) -> dict:
         if not response.tool_calls:
             break
 
-        # Filter to known read tools only
         valid   = [tc for tc in response.tool_calls if tc["name"] in tool_map]
         unknown = [tc["name"] for tc in response.tool_calls if tc["name"] not in tool_map]
         if unknown:
             log.warning("v4: LLM tried unknown tools %s — skipping", unknown)
-
         if not valid:
             continue
 
-        # Split into new calls vs already-cached duplicates
         new_calls:   dict[str, dict] = {}
         reuse_calls: dict[str, dict] = {}
         for tc in valid:
-            if tc["name"] in raw_results:
-                reuse_calls[tc["name"]] = tc
-            else:
-                new_calls[tc["name"]] = tc
+            (reuse_calls if tc["name"] in raw_results else new_calls)[tc["name"]] = tc
 
         log.info("→ round: %s%s",
                  [tc["name"] for tc in valid],
                  "  [parallel]" if len(valid) > 1 else "")
 
-        # Inject cached results for duplicates — no network call needed
+        # Inject cached results — no network call needed
         for name, tc in reuse_calls.items():
             messages.append(
                 ToolMessage(content=str(raw_results[name]), tool_call_id=tc["id"], name=name)
             )
             log.info("↺ reused cached result for %s", name)
 
-        # Execute new calls in parallel with retry
+        # Execute new calls in parallel — call_tool handles retry + circuit breaker
         if new_calls:
-            results = None
-            for attempt in range(1, MAX_RETRIES + 1):
-                try:
-                    results = await asyncio.gather(*[
-                        tool_map[name].ainvoke(tc["args"])
-                        for name, tc in new_calls.items()
-                    ])
-                    break
-                except Exception as exc:
-                    clean = _clean_error(exc)
-                    log.error("tool gather attempt %d/%d failed: %s", attempt, MAX_RETRIES, clean)
-                    if attempt < MAX_RETRIES:
-                        await asyncio.sleep(RETRY_DELAY * attempt)  # linear backoff
-                    else:
-                        return {"messages": messages, "status": "error", "error": clean}
+            try:
+                results = await asyncio.gather(*[
+                    call_tool(tool_map[name], tc["args"])
+                    for name, tc in new_calls.items()
+                ])
+            except CircuitBreakerError as exc:
+                err = f"Circuit breaker open — MCP tools unavailable: {exc}"
+                log.error(err)
+                return {"messages": messages, "status": "error", "error": err}
+            except Exception as exc:
+                clean = _clean_error(exc)
+                log.error("tool gather failed: %s", clean)
+                return {"messages": messages, "status": "error", "error": clean}
 
             for (name, tc), result in zip(new_calls.items(), results):
                 raw_results[name] = result
@@ -458,7 +422,6 @@ async def llm_plan_node(state: V4State) -> dict:
         parsed = MCPToolStep._parse(raw)
         data   = parsed.get("data", parsed)
 
-        # Surface GraphQL errors
         gql_errors = parsed.get("errors") or data.get("errors")
         if gql_errors:
             first   = gql_errors[0] if isinstance(gql_errors, list) else gql_errors
@@ -484,7 +447,7 @@ async def llm_plan_node(state: V4State) -> dict:
         summary = {
             k: (f"{str(v)[:60]}…" if isinstance(v, str) and len(v) > 60
                 else type(v).__name__ if not isinstance(v, (str, int, float, bool))
-                else v)
+            else v)
             for k, v in extracted.items()
         }
         log.info("✓ %-30s  → %s", tool_name, summary)
@@ -675,7 +638,6 @@ def _build_graph():
 
     g.add_edge(START, "llm_plan_node")
     g.add_conditional_edges("llm_plan_node",   _after_llm_plan_node,   {"plan_gate": "plan_gate", END: END})
-    # plan_gate / dock_gate return Command(goto=...) — no static edges needed
     g.add_conditional_edges("create_shipment", _after_create_shipment, {"dock_gate": "dock_gate", END: END})
     g.add_edge("book_dock", END)
 
@@ -692,7 +654,6 @@ def _config(thread_id: str) -> dict:
 
 
 def _get_interrupt(snapshot) -> dict | None:
-    """Extract the first interrupt payload from a graph snapshot."""
     for task in (getattr(snapshot, "tasks", None) or []):
         for intr in (getattr(task, "interrupts", None) or []):
             return getattr(intr, "value", None)
