@@ -20,3 +20,6 @@ langchain-mcp-adapters==0.2.1
 langgraph>=0.2.0
 langchain-core>=0.3.0
 langchain-openai>=0.2.0
+langchain-mistralai>=0.2.0
+aiobreaker>=1.0.0
+tenacity>=8.0.0

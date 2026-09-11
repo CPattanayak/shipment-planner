@@ -4,12 +4,8 @@ Shipment Planning — Hybrid (LangGraph StateGraph + explicit MCP tool nodes)
 Architecture
 ────────────
   One dedicated pipeline node replaces the two original MCP nodes.
-  It delegates all MCP reads to the shared mcp_pipeline framework using
-  run_parallel_planning_pipeline():
-
-    Round 1 (parallel) — GetWarehouseCapacity + OptimizeRoute  (asyncio.gather)
-    Round 2            — GetAvailableCarriers  (needs origin_postal from R1)
-    Round 3            — GetCarrierQuote        (needs best_carrier from R2)
+  It delegates all MCP reads to the shared mcp_pipeline framework:
+    GetWarehouseCapacity → OptimizeRoute → GetAvailableCarriers → GetCarrierQuote
 
   Each step is a self-contained MCPToolStep subclass (see mcp_pipeline.py)
   that declares its inputs, validates its output, and writes to the shared
@@ -59,7 +55,7 @@ from agent_v3 import (
     _M_BOOK_DOCK_SLOT,
 )
 from config import MCP_SERVER_URL
-from mcp_pipeline import ToolContext, run_parallel_planning_pipeline
+from mcp_pipeline import ToolContext, run_planning_pipeline
 
 log = logging.getLogger(__name__)
 
@@ -113,12 +109,8 @@ class HState(TypedDict):
 
 async def pipeline_node(state: HState) -> dict:
     """
-    Runs all four MCP read steps through the shared pipeline framework with
-    Round 1 parallelised via asyncio.gather():
-
-      Round 1 (parallel) — GetWarehouseCapacity + OptimizeRoute
-      Round 2            — GetAvailableCarriers  (needs origin_postal from R1)
-      Round 3            — GetCarrierQuote        (needs best_carrier from R2)
+    Runs all four MCP read steps through the shared pipeline framework:
+      GetWarehouseCapacity → OptimizeRoute → GetAvailableCarriers → GetCarrierQuote
 
     Each step logs → / ✓ / ✗ and writes its extracted values into the shared
     ToolContext.  On the first failure the pipeline stops and returns an error.
@@ -142,7 +134,7 @@ async def pipeline_node(state: HState) -> dict:
     })
 
     tool_map = await _get_tools()
-    ok, err  = await run_parallel_planning_pipeline(ctx, tool_map)
+    ok, err  = await run_planning_pipeline(ctx, tool_map)
 
     if not ok:
         return {"status": "error", "error": err}
