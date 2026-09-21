@@ -23,3 +23,9 @@ langchain-openai>=0.2.0
 langchain-mistralai>=0.2.0
 aiobreaker>=1.0.0
 tenacity>=8.0.0
+# AutoGen 0.2.x classic API (AssistantAgent / UserProxyAgent / register_function).
+# 0.2.36 is the last stable 0.2 release before the package was restructured into
+# autogen-agentchat (0.4.x).  The >=0.2.0 range can pull in 0.3+ which renamed
+# internals and breaks import autogen.  Pin to the known-good release.
+# pyautogen==0.2.35 is installed via Dockerfile BEFORE this file so pip can
+# resolve flaml[automl] without conflicting with the MCP/LangChain stack.

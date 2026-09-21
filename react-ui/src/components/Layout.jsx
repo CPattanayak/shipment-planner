@@ -17,6 +17,7 @@ const NAV_GROUPS = [
       { to: '/compare',   label: '📊 Compare',  badge: null },
       { to: '/shipments', label: '📦 Shipments', badge: null },
       { to: '/ask',       label: '🤖 Ask Agent', badge: null },
+      { to: '/chat',      label: '💬 Chat',      badge: 'AutoGen' },
       { to: '/admin',     label: '🛠 Admin',     badge: null },
     ],
   },

@@ -1,5 +1,0 @@
-package com.shipmentplanner.model;
-public enum ShipmentStatus {
-    DRAFT, PENDING_CARRIER, CARRIER_CONFIRMED, PICKUP_SCHEDULED,
-    IN_TRANSIT, OUT_FOR_DELIVERY, DELIVERED, EXCEPTION, CANCELLED
-}

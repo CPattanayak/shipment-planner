@@ -46,6 +46,7 @@ from agent_v4 import (
     confirm_plan as confirm_plan_v4,
     confirm_dock as confirm_dock_v4,
 )
+from chat_router import router as chat_router
 from config import GRAPHQL_ENDPOINT
 from models import (
     AskRequest,
@@ -76,6 +77,8 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+app.include_router(chat_router)
 
 
 # ── Health ────────────────────────────────────────────────────────────────────

@@ -9,6 +9,7 @@ import ShipmentList from './pages/ShipmentList';
 import ShipmentDetail from './pages/ShipmentDetail';
 import AskAgent from './pages/AskAgent';
 import Admin from './pages/Admin';
+import ChatPage from './pages/ChatPage';
 
 export default function App() {
   return (
@@ -26,6 +27,7 @@ export default function App() {
         <Route path="/shipments/:id"  element={<ShipmentDetail />} />
         <Route path="/ask"            element={<AskAgent />} />
         <Route path="/admin"          element={<Admin />} />
+        <Route path="/chat"           element={<ChatPage />} />
       </Routes>
     </Layout>
   );

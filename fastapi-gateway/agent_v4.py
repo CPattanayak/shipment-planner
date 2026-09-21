@@ -448,7 +448,7 @@ async def llm_plan_node(state: V4State) -> dict:
         summary = {
             k: (f"{str(v)[:60]}…" if isinstance(v, str) and len(v) > 60
                 else type(v).__name__ if not isinstance(v, (str, int, float, bool))
-            else v)
+                else v)
             for k, v in extracted.items()
         }
         log.info("✓ %-30s  → %s", tool_name, summary)

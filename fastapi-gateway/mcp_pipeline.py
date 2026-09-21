@@ -16,12 +16,55 @@ Running the pipeline is one call:
 Adding a new tool = one new subclass of MCPToolStep.
 """
 
+import ast
+import asyncio
 import json
 import logging
+import re
 from abc import ABC, abstractmethod
 from datetime import datetime, timezone
 
 log = logging.getLogger(__name__)
+
+
+def _clean_error(exc_or_str) -> str:
+    """Extract a human-readable message from an exception that may contain
+    a JSON GraphQL error body, a FastAPI detail blob, or a Python repr."""
+    s = str(exc_or_str)
+    match = re.search(r'\{.*\}', s, re.DOTALL)
+    if match:
+        try:
+            data = json.loads(match.group())
+            errors = data.get("errors")
+            if isinstance(errors, list) and errors:
+                msg = errors[0].get("message") if isinstance(errors[0], dict) else None
+                if msg:
+                    return msg
+            detail = data.get("detail")
+            if isinstance(detail, str) and detail:
+                try:
+                    inner = json.loads(detail)
+                    errors2 = inner.get("errors")
+                    if isinstance(errors2, list) and errors2:
+                        msg = errors2[0].get("message") if isinstance(errors2[0], dict) else None
+                        if msg:
+                            return msg
+                except Exception:
+                    pass
+                return detail
+        except Exception:
+            pass
+    match2 = re.search(r"\[.*\]", s, re.DOTALL)
+    if match2:
+        try:
+            items = ast.literal_eval(match2.group())
+            if isinstance(items, list) and items:
+                first = items[0]
+                if isinstance(first, dict) and first.get("message"):
+                    return first["message"]
+        except Exception:
+            pass
+    return s
 
 
 # ── Context ────────────────────────────────────────────────────────────────────
@@ -40,13 +83,22 @@ class MCPToolStep(ABC):
     Base class for a single MCP tool call in the pipeline.
 
     Subclasses implement:
-      tool_name  — name as registered in the MCP server (e.g. "GetWarehouseCapacity")
-      inputs()   — build the args dict from context
-      extract()  — pull relevant fields from parsed response data
-      validate() — return an error string if extracted data is unusable, else None
+      tool_name     — name as registered in the MCP server (e.g. "GetWarehouseCapacity")
+      REQUIRED_ARGS — {arg_name: expected_python_type} used by validate_args()
+      inputs()      — build the args dict from context
+      extract()     — pull relevant fields from parsed response data
+      validate()    — return an error string if extracted data is unusable, else None
+
+    validate_args() is called automatically inside run() before ainvoke.
+    It can also be called externally (e.g. agent_v4 loop) to pre-screen
+    LLM-emitted args before spending a network round-trip.
     """
 
     tool_name: str = ""
+
+    # Declare required args as {arg_name: expected_python_type}.
+    # An empty dict disables structural pre-validation for that step.
+    REQUIRED_ARGS: dict[str, type] = {}
 
     # ── Internal helpers ───────────────────────────────────────────────────────
 
@@ -72,6 +124,39 @@ class MCPToolStep(ABC):
             except json.JSONDecodeError:
                 return {"_raw_list_text": text}
         return raw if isinstance(raw, dict) else {"_raw": str(raw)}
+
+    # ── Pre-validation ─────────────────────────────────────────────────────────
+
+    def validate_args(self, args: dict) -> str | None:
+        """
+        Structural pre-validation of args before the tool is called.
+
+        Checks every entry in REQUIRED_ARGS:
+          • present and not None / empty string
+          • correct Python type (int is accepted where float is declared)
+
+        Returns a human-readable error string on the first problem, else None.
+        Subclasses may override to add domain-specific checks while still
+        calling super().validate_args(args) for the structural pass.
+        """
+        for arg_name, expected_type in self.REQUIRED_ARGS.items():
+            val = args.get(arg_name)
+            # Missing or blank
+            if val is None or val == "":
+                return (
+                    f"{self.tool_name}: missing required arg '{arg_name}' "
+                    f"(expected {expected_type.__name__})"
+                )
+            # Type check — allow int where float is expected (LLMs often omit .0)
+            if not isinstance(val, expected_type):
+                if expected_type is float and isinstance(val, (int, float)):
+                    pass  # coercible
+                else:
+                    return (
+                        f"{self.tool_name}: '{arg_name}' must be "
+                        f"{expected_type.__name__}, got {type(val).__name__} ({val!r})"
+                    )
+        return None
 
     # ── Subclass interface ─────────────────────────────────────────────────────
 
@@ -123,6 +208,12 @@ class MCPToolStep(ABC):
             log.error("✗ %s  %s", self.tool_name, msg)
             return False, msg
 
+        # Pre-validate args before spending a network round-trip
+        arg_err = self.validate_args(args)
+        if arg_err:
+            log.error("✗ %s  pre-validation failed: %s", self.tool_name, arg_err)
+            return False, arg_err
+
         log.info("→ %-30s  args=%s", self.tool_name, args)
 
         # Call MCP tool
@@ -140,7 +231,9 @@ class MCPToolStep(ABC):
         # Surface GraphQL errors
         gql_errors = parsed.get("errors")
         if gql_errors:
-            msg = f"{self.tool_name} GraphQL error: {gql_errors}"
+            first = gql_errors[0] if isinstance(gql_errors, list) else gql_errors
+            raw_msg = first.get("message", str(gql_errors)) if isinstance(first, dict) else str(gql_errors)
+            msg = f"[{self.tool_name}] {raw_msg}"
             log.error("✗ %s  errors=%s", self.tool_name, gql_errors)
             return False, msg
 
@@ -177,6 +270,53 @@ class MCPToolStep(ABC):
         log.info("✓ %-30s  → %s", self.tool_name, summary)
         return True, None
 
+    async def process(self, raw, ctx: ToolContext) -> tuple[bool, str | None]:
+        """
+        Process a raw result already fetched externally (e.g. via asyncio.gather()).
+        Runs parse → GraphQL-error check → extract → validate → ctx.update().
+        Same log format as run(), but skips the tool call itself.
+
+        Returns (success: bool, error_message: str | None).
+        """
+        parsed = self._parse(raw)
+        log.debug("   %s  parsed_keys=%s", self.tool_name, list(parsed.keys()))
+
+        gql_errors = parsed.get("errors")
+        if gql_errors:
+            first = gql_errors[0] if isinstance(gql_errors, list) else gql_errors
+            raw_msg = first.get("message", str(gql_errors)) if isinstance(first, dict) else str(gql_errors)
+            msg = f"[{self.tool_name}] {raw_msg}"
+            log.error("✗ %s  errors=%s", self.tool_name, gql_errors)
+            return False, msg
+
+        data = parsed.get("data", parsed)
+
+        try:
+            extracted = self.extract(data, ctx)
+        except Exception as exc:
+            msg = f"{self.tool_name} extract() raised: {exc}"
+            log.error("✗ %s  %s", self.tool_name, msg)
+            return False, msg
+
+        err = self.validate(extracted, ctx)
+        if err:
+            log.warning(
+                "✗ %-30s  %s  (data_keys=%s)",
+                self.tool_name, err, list(data.keys()),
+            )
+            return False, err
+
+        ctx.update(extracted)
+
+        summary = {
+            k: (f"{str(v)[:60]}…" if isinstance(v, str) and len(v) > 60
+                else type(v).__name__ if not isinstance(v, (str, int, float, bool))
+                else v)
+            for k, v in extracted.items()
+        }
+        log.info("✓ %-30s  → %s", self.tool_name, summary)
+        return True, None
+
 
 # ── Tool steps ─────────────────────────────────────────────────────────────────
 
@@ -187,6 +327,7 @@ class GetWarehouseCapacityStep(MCPToolStep):
     Output: warehouse, capacity, origin_postal
     """
     tool_name = "GetWarehouseCapacity"
+    REQUIRED_ARGS = {"id": str}
 
     def inputs(self, ctx):
         return {"id": ctx["request"]["originWarehouseId"]}
@@ -216,6 +357,13 @@ class OptimizeRouteStep(MCPToolStep):
     Output: route, delivery_date
     """
     tool_name = "OptimizeRoute"
+    REQUIRED_ARGS = {
+        "originWarehouseId":     str,
+        "destinationPostalCode": str,
+        "destinationCountry":    str,
+        "weightKg":              float,
+        "volumeM3":              float,
+    }
 
     def inputs(self, ctx):
         req = ctx["request"]
@@ -247,6 +395,11 @@ class GetAvailableCarriersStep(MCPToolStep):
     Output: carriers, best_carrier  (max onTimeDeliveryRate)
     """
     tool_name = "GetAvailableCarriers"
+    REQUIRED_ARGS = {
+        "originPostalCode":      str,
+        "destinationPostalCode": str,
+        "weightKg":              float,
+    }
 
     def inputs(self, ctx):
         dst = ctx["request"]["destinationAddress"]
@@ -282,6 +435,14 @@ class GetCarrierQuoteStep(MCPToolStep):
     Output: quote
     """
     tool_name = "GetCarrierQuote"
+    REQUIRED_ARGS = {
+        "carrierId":             str,
+        "originPostalCode":      str,
+        "destinationPostalCode": str,
+        "weightKg":              float,
+        "volumeM3":              float,
+        "serviceLevel":          str,
+    }
 
     def inputs(self, ctx):
         dst = ctx["request"]["destinationAddress"]
@@ -315,7 +476,7 @@ PLANNING_STEPS: list[MCPToolStep] = [
 
 async def run_planning_pipeline(ctx: ToolContext, tool_map: dict) -> tuple[bool, str | None]:
     """
-    Run all PLANNING_STEPS in order.
+    Run all PLANNING_STEPS sequentially.
     Each step reads from ctx and writes back on success.
     Stops and returns (False, error) on the first failure.
     Returns (True, None) when all steps succeed.
@@ -327,4 +488,88 @@ async def run_planning_pipeline(ctx: ToolContext, tool_map: dict) -> tuple[bool,
             log.error("pipeline aborted at %s  error=%s", step.tool_name, err)
             return False, err
     log.info("pipeline complete")
+    return True, None
+
+
+_R1_STEPS = (GetWarehouseCapacityStep(), OptimizeRouteStep())
+_R2_STEP  = GetAvailableCarriersStep()
+_R3_STEP  = GetCarrierQuoteStep()
+
+
+async def run_parallel_planning_pipeline(
+    ctx: ToolContext, tool_map: dict
+) -> tuple[bool, str | None]:
+    """
+    Run the four planning MCP reads in dependency order with R1 parallelised:
+
+      Round 1 (parallel) — GetWarehouseCapacity + OptimizeRoute
+        Both are independent; fired with asyncio.gather() for minimum latency.
+
+      Round 2 (sequential) — GetAvailableCarriers
+        Needs origin_postal from GetWarehouseCapacity (written in R1).
+
+      Round 3 (sequential) — GetCarrierQuote
+        Needs best_carrier from GetAvailableCarriers (written in R2).
+
+    Returns (True, None) on full success or (False, error_message) on the
+    first failure.
+    """
+    # ── Round 1: parallel fetch ────────────────────────────────────────────────
+    r1_names = [s.tool_name for s in _R1_STEPS]
+    log.info("pipeline R1 [parallel]  steps=%s", r1_names)
+
+    # Guard: all R1 tools must be present before launching
+    for step in _R1_STEPS:
+        if step.tool_name not in tool_map:
+            msg = (
+                f"{step.tool_name} not found in MCP tool map. "
+                f"Available: {list(tool_map.keys())}"
+            )
+            log.error("✗ %s  %s", step.tool_name, msg)
+            return False, msg
+
+    # Build args and log before firing
+    r1_args = []
+    for step in _R1_STEPS:
+        try:
+            args = step.inputs(ctx)
+        except KeyError as exc:
+            msg = f"{step.tool_name} missing context key {exc} — check pipeline order."
+            log.error("✗ %s  %s", step.tool_name, msg)
+            return False, msg
+        log.info("→ %-30s  args=%s", step.tool_name, args)
+        r1_args.append(args)
+
+    try:
+        r1_raws = await asyncio.gather(
+            *[tool_map[step.tool_name].ainvoke(args)
+              for step, args in zip(_R1_STEPS, r1_args)]
+        )
+    except Exception as exc:
+        msg = _clean_error(exc)
+        log.error("✗ pipeline  R1 gather raised: %s", msg)
+        return False, msg
+
+    # Process each R1 result (parse → validate → merge into ctx)
+    for step, raw in zip(_R1_STEPS, r1_raws):
+        ok, err = await step.process(raw, ctx)
+        if not ok:
+            log.error("pipeline aborted at %s  error=%s", step.tool_name, err)
+            return False, err
+
+    # ── Round 2 ───────────────────────────────────────────────────────────────
+    log.info("pipeline R2  step=%s", _R2_STEP.tool_name)
+    ok, err = await _R2_STEP.run(ctx, tool_map)
+    if not ok:
+        log.error("pipeline aborted at %s  error=%s", _R2_STEP.tool_name, err)
+        return False, err
+
+    # ── Round 3 ───────────────────────────────────────────────────────────────
+    log.info("pipeline R3  step=%s", _R3_STEP.tool_name)
+    ok, err = await _R3_STEP.run(ctx, tool_map)
+    if not ok:
+        log.error("pipeline aborted at %s  error=%s", _R3_STEP.tool_name, err)
+        return False, err
+
+    log.info("pipeline complete (parallel R1)")
     return True, None
