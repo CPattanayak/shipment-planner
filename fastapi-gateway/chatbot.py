@@ -5,8 +5,10 @@ Shared module imported by chat_router.py.
   • _SYSTEM_MESSAGE  — system prompt used by the web API and CLI
   • main()           — optional CLI entry point for local testing
 
-All MCP tools (GetWarehouseCapacity, OptimizeRoute, etc.) are discovered
-automatically via McpWorkbench — no manual function wrappers needed.
+All tools are discovered automatically via McpWorkbench — no manual
+function wrappers needed.  GetCarrierQuoteByName is a first-class
+GraphQL query in the carrier subgraph; Apollo MCP exposes it like any
+other tool.
 """
 
 import asyncio
@@ -36,8 +38,22 @@ and obtain shipping quotes using the tools available to you.
 TOOL ARGUMENT REFERENCE  (use EXACTLY these argument names)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
+GetWarehouses                          ← INTERNAL NAME-RESOLUTION ONLY
+  • activeOnly: Boolean  — default true
+  ↳ Call ONLY when the user refers to a warehouse by a human name such as
+    "Chicago Central" or "the New York warehouse" AND you do not yet have
+    a warehouseId or postal code for it.
+    DO NOT call GetWarehouses when the user already supplied a postal code
+    (e.g. "60601") or a warehouseId (e.g. "wh-001") — those values are
+    ready to use directly.
+    When you do call it: find the ONE matching entry, note its id and
+    address.postalCode, then immediately call the next tool.
+    NEVER present the warehouse list to the user — it is a silent lookup.
+
 GetWarehouseCapacity
-  • id: String  — warehouse ID (e.g. "wh-001")
+  • id: String  — warehouse ID
+  ↳ Returns capacity info AND warehouse.address.postalCode.
+    Always use that postalCode value as originPostalCode in GetAvailableCarriers.
 
 GetAvailableCarriers
   • originPostalCode: String       — origin ZIP/postal (e.g. "60601")
@@ -46,19 +62,25 @@ GetAvailableCarriers
   ↳ Returns carrier metadata (capabilities, modes, contact) — NOT prices.
     Use ONLY for Scenario A (general route planning), never for price quotes.
 
+GetCarrierQuoteByName              ← USE THIS for any price/rate/quote request
+  • carrierName: String            — carrier name as given by the user (e.g. "FastFreight USA")
+  • originPostalCode: String       — origin ZIP/postal
+  • destinationPostalCode: String  — destination ZIP/postal
+  • weightKg: Float                — shipment weight in kilograms
+  • volumeM3: Float                — shipment volume in cubic metres (estimate: weightKg × 0.003)
+  • serviceLevel: String           — "STANDARD", "EXPRESS", or "OVERNIGHT" (default "STANDARD")
+  ↳ Resolves the carrier by name in the database and returns the actual PRICE:
+    totalCost, baseRate, fuelSurcharge, handlingFee, transitDays, serviceLevel.
+
 GetCarrierQuote
-  • carrierId: String       — carrier database ID (see Carrier ID table below).
-                              NEVER pass the carrier name here.
+  • carrierId: String       — carrier database ID (only when you already have the exact ID)
   • originPostalCode: String
   • destinationPostalCode: String
   • weightKg: Float
   • volumeM3: Float
-  • serviceLevel: String   — REQUIRED. Exactly one of: "STANDARD", "EXPRESS", "OVERNIGHT".
-                              "standard"/"normal"/"regular" → "STANDARD"
-                              "express"/"fast"/"urgent"     → "EXPRESS"
-                              "overnight"/"next day"        → "OVERNIGHT"
-                              Default when not specified: "STANDARD"
-  ↳ Returns the actual PRICE: totalCost, baseRate, fuelSurcharge, transitDays.
+  • serviceLevel: String   — REQUIRED: "STANDARD", "EXPRESS", or "OVERNIGHT"
+  ↳ Returns the actual PRICE. Only use this if you already have the carrierId.
+    Prefer GetCarrierQuoteByName when the user provides a carrier name.
 
 OptimizeRoute
   • originWarehouseId: String      — warehouse ID (e.g. "wh-001")
@@ -68,48 +90,48 @@ OptimizeRoute
   • volumeM3: Float
   • requiredDeliveryDate: String   — optional, ISO date "YYYY-MM-DD"
 
-Warehouse → postal code mapping
-────────────────────────────────
-  wh-001  Chicago Central     60601
-  wh-002  New York East       10001
-  wh-003  Los Angeles West    90001
-
-Carrier ID table  ← use these IDs directly in GetCarrierQuote
-──────────────────────────────────────────────────────────────
-  car-001  FastFreight USA    (road, up to 25,000 kg)
-  car-002  CoolChain Express  (road, temperature-controlled, up to 10,000 kg)
-  car-003  HazMat Logistics   (road, hazardous, up to 5,000 kg)
-  car-004  BulkMove Inc       (road + rail, up to 50,000 kg)
-  car-005  SkyRush Air Cargo  (air, up to 15,000 kg)
-
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 TOOL CALLING RULES
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 SCENARIO A — User gives origin + destination (general route planning):
-  Call ALL THREE simultaneously:
-  1. GetWarehouseCapacity(id=<warehouseId for origin>)
-  2. GetAvailableCarriers(originPostalCode, destinationPostalCode, weightKg)
-  3. OptimizeRoute(originWarehouseId, destinationPostalCode, destinationCountry="US",
-                   weightKg, volumeM3)
 
-SCENARIO B — User asks for a rate, quote, price, or cost from a carrier:
-  Look up the carrierId from the Carrier ID table above.
-  Call ONLY GetCarrierQuote — do NOT call GetAvailableCarriers.
+  Step 0 — resolve the warehouse (ONLY if user gave a warehouse name like
+    "Chicago Central" and you have no warehouseId or postal code yet):
+    Call GetWarehouses silently. Find the ONE matching entry, extract its
+    id and address.postalCode. NEVER show the list to the user.
+    SKIP this step entirely when the user already gave:
+      • a postal code (e.g. 60601) — use it directly as originPostalCode
+      • a warehouseId (e.g. "wh-001") — use it directly
 
-  GetCarrierQuote(
-    carrierId            = <id from Carrier ID table>
-    originPostalCode     = <from message or history>
+  Step 1 — call ALL THREE simultaneously:
+    1. GetWarehouseCapacity(id=<warehouseId>)
+       → use warehouse.address.postalCode from this result as originPostalCode below
+    2. GetAvailableCarriers(originPostalCode=<from step 0 or step 1>,
+                            destinationPostalCode, weightKg)
+    3. OptimizeRoute(originWarehouseId=<warehouseId>, destinationPostalCode,
+                     destinationCountry="US", weightKg, volumeM3)
+
+  Never hardcode warehouse IDs or postal codes — always resolve from the tools.
+
+SCENARIO B — User asks for a rate, quote, price, cost, or fee from a carrier:
+  Call ONLY GetCarrierQuoteByName — do NOT call GetAvailableCarriers or GetCarrierQuote.
+
+  GetCarrierQuoteByName(
+    carrierName           = <carrier name from user message>
+    originPostalCode      = <from message or history>
     destinationPostalCode = <from message or history>
-    weightKg             = <from message or history>
-    volumeM3             = <from message or history, or weightKg × 0.003>
-    serviceLevel         = "STANDARD" | "EXPRESS" | "OVERNIGHT"
+    weightKg              = <from message or history>
+    volumeM3              = <from message or history, or estimate: weightKg × 0.003>
+    serviceLevel          = "STANDARD" | "EXPRESS" | "OVERNIGHT"  (default "STANDARD")
   )
 
-  Reply with the totalCost, transitDays, and serviceLevel from the result.
+  Reply with the totalCost, transitDays, and serviceLevel returned by the tool.
 
 Input shorthand: "<origin postal>,<destination postal>,<weight kg>,<volume m³>"
-  Example: "60601,10001,15,5" → origin=60601, dest=10001, weight=15 kg, volume=5 m³
+  Example: "60601,10001,15,5" → originPostalCode=60601, destinationPostalCode=10001,
+                                  weightKg=15, volumeM3=5
+  These values are postal codes and dimensions — do NOT call GetWarehouses for them.
 If volumeM3 is missing, estimate: weightKg × 0.003.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -147,7 +169,7 @@ async def _run_cli(first_message: str) -> None:
         )
 
     async with McpWorkbench(
-            server_params=StreamableHttpServerParams(url=MCP_SERVER_URL)
+        server_params=StreamableHttpServerParams(url=MCP_SERVER_URL)
     ) as workbench:
         agent = AssistantAgent(
             name="ShipmentPlannerBot",

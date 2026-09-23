@@ -1,9 +1,15 @@
 """
 AutoGen Chat — Redis-backed, pure async, MCP-native tool discovery
 ══════════════════════════════════════════════════════════════════
-Uses autogen_ext.tools.mcp.McpWorkbench to connect directly to the
-apollo-mcp-server so tool schemas are auto-discovered — no manual
-tool definitions, no threads, no queues.
+Uses autogen_ext.tools.mcp.McpWorkbench to connect to the Apollo MCP
+server.  All tools — including GetCarrierQuoteByName — are discovered
+automatically via the MCP protocol.  No FunctionTool wrappers, no
+composite gateway layer, no manual tool registration.
+
+Adding a new tool:
+  1. Add a GraphQL query/field in the relevant subgraph schema.
+  2. Drop a .graphql operation file in apollo-mcp-server/operations/.
+  3. Apollo MCP hot-reloads and exposes it — nothing changes here.
 
   POST   /api/chat/sessions              Create session → {sessionId}
   POST   /api/chat/{sessionId}           Send message → SSE stream
@@ -35,8 +41,6 @@ from autogen_agentchat.messages import (
     ToolCallRequestEvent,
     ToolCallExecutionEvent,
 )
-
-log = logging.getLogger(__name__)
 from autogen_ext.models.openai import OpenAIChatCompletionClient
 from autogen_ext.tools.mcp import McpWorkbench, StreamableHttpServerParams
 
@@ -46,8 +50,9 @@ from config import (
     MISTRAL_API_KEY, MISTRAL_MODEL,
     MCP_SERVER_URL,
 )
-
 from chatbot import _SYSTEM_MESSAGE
+
+log = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/chat", tags=["Chat"])
 
@@ -96,11 +101,14 @@ async def stream_chat(history: list[dict], user_input: str):
     """
     Pure async generator — yields SSE-ready dicts for one conversation turn.
 
-    McpWorkbench opens a connection to the MCP server, discovers all tools,
-    and hands them to AssistantAgent.  run_stream() drives the full
-    tool-call loop internally — we just forward the events.
+    McpWorkbench opens a connection to the Apollo MCP server and discovers
+    all tools automatically, including GetCarrierQuoteByName.
+    AssistantAgent.run_stream() drives the full tool-call loop internally.
+
+    Post-loop fallback: if autogen doesn't emit a TextMessage (some
+    provider/model combinations stop after the tool call), we call the
+    LLM directly to produce a human-friendly summary.
     """
-    # Build the task: inject prior history as text context so the LLM has memory
     if history:
         ctx = "\n".join(
             f"{'User' if m['role'] == 'user' else 'Assistant'}: {m['content']}"
@@ -111,9 +119,6 @@ async def stream_chat(history: list[dict], user_input: str):
         task = user_input
 
     final_content: list[str] = []
-    # Accumulate raw tool results so we can summarise them if autogen doesn't
-    # produce a TextMessage on its own (AssistantAgent.run_stream sometimes
-    # skips the follow-up LLM call when using McpWorkbench).
     tool_results_for_summary: list[str] = []
 
     async with McpWorkbench(server_params=_MCP_PARAMS) as workbench:
@@ -156,17 +161,17 @@ async def stream_chat(history: list[dict], user_input: str):
                 final_content.append(event.content)
                 yield {"type": "message", "content": event.content}
 
-    # ── Post-loop: if autogen never emitted a TextMessage, summarise manually ──
+    # ── Post-loop fallback ─────────────────────────────────────────────────────
     if not final_content:
         if tool_results_for_summary:
-            log.info("no TextMessage received — calling LLM to summarise %d tool results",
+            log.info("no TextMessage received — summarising %d tool results",
                      len(tool_results_for_summary))
             summary_prompt = (
-                    f"The user asked: {user_input}\n\n"
-                    "The following tool results were returned:\n\n"
-                    + "\n\n".join(tool_results_for_summary)
-                    + "\n\nWrite a friendly, plain-language summary for the user. "
-                      "Use short bullet points. Do NOT show raw JSON or IDs."
+                f"The user asked: {user_input}\n\n"
+                "The following tool results were returned:\n\n"
+                + "\n\n".join(tool_results_for_summary)
+                + "\n\nWrite a friendly, plain-language summary for the user. "
+                  "Use short bullet points. Do NOT show raw JSON or IDs."
             )
             model_client = _make_model_client()
             from autogen_core.models import UserMessage as _UserMessage

@@ -336,6 +336,7 @@ input ShipmentItemInput        @join__type(graph: SHIPMENT) { sku: String!  desc
 input CreateShipmentInput      @join__type(graph: SHIPMENT) { originWarehouseId: ID!  destinationAddress: AddressInput!  items: [ShipmentItemInput!]!  priority: ShipmentPriority!  scheduledPickup: String  specialInstructions: String }
 input AvailabilityInput        @join__type(graph: CARRIER)  { originPostalCode: String!  destinationPostalCode: String!  weightKg: Float!  hasHazardous: Boolean!  requiresTemperatureControl: Boolean!  serviceLevel: String! }
 input QuoteInput               @join__type(graph: CARRIER)  { carrierId: ID!  originPostalCode: String!  destinationPostalCode: String!  weightKg: Float!  volumeM3: Float!  serviceLevel: String! }
+input QuoteByNameInput         @join__type(graph: CARRIER)  { carrierName: String!  originPostalCode: String!  destinationPostalCode: String!  weightKg: Float!  volumeM3: Float!  serviceLevel: String! }
 input CreateCarrierInput       @join__type(graph: CARRIER)  { name: String!  code: String!  contactEmail: String  supportedModes: [String!]!  serviceAreas: [String!]! }
 input BookingInput             @join__type(graph: CARRIER)  { carrierId: ID!  shipmentId: ID!  serviceLevel: String!  requestedPickupDate: String! }
 input RouteOptimizationInput   @join__type(graph: ROUTE)    { originWarehouseId: ID!  destinationPostalCode: String!  destinationCountry: String!  weightKg: Float!  volumeM3: Float!  totalValueUsd: Float!  hasHazardous: Boolean!  requiresTemperatureControl: Boolean!  requiredDeliveryDate: String  priority: String! }
@@ -361,6 +362,7 @@ type Query
   carriers(activeOnly: Boolean = true):                          [Carrier!]!       @join__field(graph: CARRIER)
   availableCarriers(input: AvailabilityInput!):                  [Carrier!]!       @join__field(graph: CARRIER)
   carrierQuote(input: QuoteInput!):                              CarrierQuote!     @join__field(graph: CARRIER)
+  carrierQuoteByName(input: QuoteByNameInput!):                  CarrierQuote!     @join__field(graph: CARRIER)
 
   # Route subgraph
   route(id: ID!):                                                 Route             @join__field(graph: ROUTE)

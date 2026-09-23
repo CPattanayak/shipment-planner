@@ -1,0 +1,32 @@
+# Tool: GetWarehouses
+# Lists all active warehouses with their IDs, names, and postal codes.
+#
+# Use this tool when the user refers to a warehouse by name
+# (e.g. "Chicago Central", "the New York warehouse") and you need
+# to resolve it to a warehouseId + postalCode before calling
+# GetWarehouseCapacity, OptimizeRoute, or GetAvailableCarriers.
+# Call it once, then extract the matching warehouse's id and
+# address.postalCode from the result.
+query GetWarehouses($activeOnly: Boolean = true) {
+  warehouses(activeOnly: $activeOnly) {
+    id
+    code
+    name
+    capacityM3
+    usedM3
+    availableM3
+    utilizationPct
+    active
+    capabilities
+    contactEmail
+    address {
+      street
+      city
+      state
+      country
+      postalCode
+      lat
+      lng
+    }
+  }
+}

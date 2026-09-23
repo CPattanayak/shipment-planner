@@ -18,6 +18,7 @@ type Query {
   carriers(activeOnly: Boolean = true): [Carrier!]!
   availableCarriers(input: AvailabilityInput!): [Carrier!]!
   carrierQuote(input: QuoteInput!): CarrierQuote!
+  carrierQuoteByName(input: QuoteByNameInput!): CarrierQuote!
 }
 
 type Mutation {
@@ -90,6 +91,17 @@ input AvailabilityInput {
 
 input QuoteInput {
   carrierId: ID!
+  originPostalCode: String!
+  destinationPostalCode: String!
+  weightKg: Float!
+  volumeM3: Float!
+  serviceLevel: String!
+}
+
+# Name-based quote input — the resolver resolves the name to a carrier ID
+# internally, so callers never need to know the carrier's database ID.
+input QuoteByNameInput {
+  carrierName: String!
   originPostalCode: String!
   destinationPostalCode: String!
   weightKg: Float!

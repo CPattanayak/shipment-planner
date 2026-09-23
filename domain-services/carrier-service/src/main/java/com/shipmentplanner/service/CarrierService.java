@@ -108,6 +108,30 @@ public class CarrierService {
         return quote;
     }
 
+    /**
+     * Resolve a carrier by its human-readable {@code carrierName} and return
+     * a price quote.  The name lookup is case-insensitive; the rest of the
+     * pricing logic is identical to {@link #getQuote(Map)}.
+     *
+     * <p>This method is the backing logic for the {@code carrierQuoteByName}
+     * GraphQL query — callers never need to know the carrier's database ID.
+     *
+     * @throws BusinessException (NOT_FOUND) when no carrier matches the name.
+     */
+    public Map<String, Object> getQuoteByName(Map<String, Object> input) {
+        String carrierName = (String) input.get("carrierName");
+
+        Carrier carrier = carrierRepository.findByNameIgnoreCase(carrierName)
+                .orElseThrow(() -> new BusinessException(
+                        ErrorType.NOT_FOUND,
+                        "No carrier found with name: " + carrierName));
+
+        // Delegate to the existing getQuote() — just swap carrierId in.
+        Map<String, Object> quoteInput = new HashMap<>(input);
+        quoteInput.put("carrierId", carrier.getId());
+        return getQuote(quoteInput);
+    }
+
     @Transactional
     public Carrier createCarrier(Map<String, Object> input) {
         Carrier carrier = new Carrier();

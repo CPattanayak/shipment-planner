@@ -43,6 +43,15 @@ public class CarrierResolver {
         return carrierService.getQuote(input);
     }
 
+    /**
+     * Resolves a carrier by its human-readable name and returns a price quote
+     * in a single call — no carrier ID required.
+     */
+    @QueryMapping
+    public Map<String, Object> carrierQuoteByName(@Argument Map<String, Object> input) {
+        return carrierService.getQuoteByName(input);
+    }
+
     // -------------------------
     // Mutations
     // -------------------------

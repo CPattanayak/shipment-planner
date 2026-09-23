@@ -1,0 +1,36 @@
+# Tool: GetCarrierQuoteByName
+# Gets a binding price quote from a carrier identified by its human-readable
+# name (case-insensitive).  The carrier service resolves the name to an ID
+# internally — callers never need the database ID.
+#
+# Use this tool whenever the user asks for a rate, quote, price, cost, or fee
+# from a specific carrier.  Do NOT call GetAvailableCarriers first.
+query GetCarrierQuoteByName(
+  $carrierName: String!
+  $originPostalCode: String!
+  $destinationPostalCode: String!
+  $weightKg: Float!
+  $volumeM3: Float!
+  $serviceLevel: String!
+) {
+  carrierQuoteByName(
+    input: {
+      carrierName: $carrierName
+      originPostalCode: $originPostalCode
+      destinationPostalCode: $destinationPostalCode
+      weightKg: $weightKg
+      volumeM3: $volumeM3
+      serviceLevel: $serviceLevel
+    }
+  ) {
+    carrierId
+    carrierName
+    baseRate
+    fuelSurcharge
+    handlingFee
+    totalCost
+    transitDays
+    serviceLevel
+    validUntil
+  }
+}
