@@ -5,16 +5,19 @@ httpx
 pydantic>=2.7.4
 python-dotenv
 sse-starlette
+redis>=5.0.0
 
-# ── LangChain / LangGraph / MCP ecosystem ────────────────────────────────────
+# ── AutoGen 0.4.x (async, MCP-native) ────────────────────────────────────────
+# autogen-agentchat  — AssistantAgent, run_stream(), message types
+# autogen-ext[openai] — OpenAIChatCompletionClient (works with OpenRouter too)
+# autogen-ext[mcp]   — McpWorkbench, StreamableHttpServerParams
 #
-# langchain-mcp-adapters==0.2.1 uses mcp 1.x internals:
-#   mcp.shared.context.RequestContext, mcp.shared.session.ProgressFnT,
-#   StreamableHTTPTransport._handle_sse_event.
-# mcp 2.x restructured all of these → cap at <2.0.0 so pip stays on 1.x.
-# 0.3.0+ of langchain-mcp-adapters require a renamed API in mcp 1.x
-# (streamable_http_client vs streamablehttp_client) → pin exactly 0.2.1.
+# NOTE: pyautogen 0.2.x (classic AssistantAgent/UserProxyAgent) is NOT used
+# anymore; remove the pyautogen==0.2.35 line from the Dockerfile as well.
+autogen-agentchat>=0.4.0
+autogen-ext[openai,mcp]>=0.4.0
 
+# ── LangGraph agent (non-chat routes use this) ────────────────────────────────
 mcp>=1.0.0,<2.0.0
 langchain-mcp-adapters==0.2.1
 langgraph>=0.2.0
@@ -23,9 +26,3 @@ langchain-openai>=0.2.0
 langchain-mistralai>=0.2.0
 aiobreaker>=1.0.0
 tenacity>=8.0.0
-# AutoGen 0.2.x classic API (AssistantAgent / UserProxyAgent / register_function).
-# 0.2.36 is the last stable 0.2 release before the package was restructured into
-# autogen-agentchat (0.4.x).  The >=0.2.0 range can pull in 0.3+ which renamed
-# internals and breaks import autogen.  Pin to the known-good release.
-# pyautogen==0.2.35 is installed via Dockerfile BEFORE this file so pip can
-# resolve flaml[automl] without conflicting with the MCP/LangChain stack.

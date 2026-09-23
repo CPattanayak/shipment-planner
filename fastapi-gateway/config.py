@@ -23,6 +23,9 @@ MISTRAL_API_KEY = os.getenv("MISTRAL_API_KEY", "")
 MISTRAL_MODEL   = os.getenv("MISTRAL_MODEL", "mistral-large-latest")
 
 # ── MCP Server ────────────────────────────────────────────────────────────────
+# Apollo MCP Server — exposes GraphQL read tools (GetWarehouseCapacity, etc.)
+# Inside Docker : http://apollo-mcp-server:8000/mcp
+# On host       : http://localhost:8090/mcp
 MCP_SERVER_URL      = os.getenv("MCP_SERVER_URL", "http://localhost:8090/mcp")
 
 # ── Prompt MCP Server ─────────────────────────────────────────────────────────
@@ -34,3 +37,8 @@ PROMPT_MCP_SERVER_URL = os.getenv("PROMPT_MCP_SERVER_URL", "http://localhost:809
 
 # ── Apollo Router ─────────────────────────────────────────────────────────────
 GRAPHQL_ENDPOINT    = os.getenv("GRAPHQL_ENDPOINT", "http://localhost:4000/graphql")
+
+# ── Redis (chat session store) ────────────────────────────────────────────────
+# Chat history is stored here with a TTL so sessions expire automatically.
+REDIS_URL        = os.getenv("REDIS_URL",        "redis://localhost:6379")
+CHAT_SESSION_TTL = int(os.getenv("CHAT_SESSION_TTL", "3600"))  # seconds, default 1 h

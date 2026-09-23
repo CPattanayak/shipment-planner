@@ -128,10 +128,20 @@ services:
       --config /dist/config/router.yaml
       --supergraph /dist/schema/supergraph.graphql
     depends_on:
-      - shipment-service
-      - route-service
-      - carrier-service
-      - warehouse-service
+      # service_started (not service_healthy) — Spring Boot containers have no
+      # healthcheck; the router retries subgraph connections on its own once they
+      # come up, so we only need the containers to exist before the router starts.
+      shipment-service:
+        condition: service_started
+      route-service:
+        condition: service_started
+      carrier-service:
+        condition: service_started
+      warehouse-service:
+        condition: service_started
+    # No healthcheck: the Apollo Router image is distroless (no shell, curl, or
+    # wget).  apollo-mcp-server uses service_started below and will restart until
+    # the router is actually ready.
 
   # ── Apollo MCP Server ───────────────────────────────────────────────────────
   # Official image: ghcr.io/apollographql/apollo-mcp-server
@@ -153,7 +163,11 @@ services:
       - ./apollo-federation/supergraph.graphql:/supergraph/supergraph.graphql:ro
     command: ["/config.yaml"]
     depends_on:
-      - apollo-router
+      apollo-router:
+        condition: service_started
+    # No healthcheck: apollo-mcp-server image is also distroless (no curl/wget/sh).
+    # fastapi-gateway uses service_started for this service and McpWorkbench
+    # retries the MCP connection per request, so the gateway handles a slow start.
 
   # ── Prompt MCP Server (fastapi-mcp) ─────────────────────────────────────────
   # Serves versioned planning system prompts as MCP resources.
@@ -177,6 +191,41 @@ services:
     volumes:
       # Mount prompts dir so you can add/edit .txt files without rebuilding
       - ./fastapi-mcp/prompts:/app/prompts:ro
+    healthcheck:
+      # MCP streamable-HTTP needs an initialize handshake before ping.
+      # We just verify the server is listening: any HTTP response (not 000
+      # which curl returns on connection refused) means the server is ready.
+      test: >-
+        curl -s -o /dev/null -w '%{http_code}'
+        -X POST http://localhost:8091/mcp
+        -H "Content-Type: application/json"
+        -H "Accept: application/json, text/event-stream"
+        -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"hc","version":"0"}}}'
+        | grep -qE '^[1-5]'
+      interval: 10s
+      timeout: 5s
+      retries: 8
+      start_period: 15s
+
+  # ── Redis (chat session store) ──────────────────────────────────────────────
+  # Stores AutoGen conversation history per session with a configurable TTL
+  # (default 1 h — set CHAT_SESSION_TTL in .env to override).
+  # Sessions expire automatically; no manual cleanup needed.
+  redis:
+    image: redis:7-alpine
+    container_name: sp-redis
+    restart: unless-stopped
+    networks: [shipment-net]
+    ports:
+      - "6379:6379"
+    command: redis-server --appendonly yes
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
 
   # ── FastAPI Gateway (LangGraph + OpenRouter / Mistral AI) ───────────────────
   fastapi-gateway:
@@ -191,11 +240,10 @@ services:
     env_file:
       - .env
     environment:
-      # Points at the official Apollo MCP Server (streamable HTTP)
+      # Apollo MCP Server — GraphQL read tools (GetWarehouseCapacity, OptimizeRoute, …)
       MCP_SERVER_URL: http://apollo-mcp-server:8000/mcp
       GRAPHQL_ENDPOINT: http://apollo-router:4000/graphql
-      # Prompt MCP server — agent_v4 fetches system prompt from here at runtime.
-      # Set to empty string to always use the built-in hardcoded fallback.
+      # Prompt MCP Server — versioned system prompts (prompt://planning/current)
       PROMPT_MCP_SERVER_URL: http://fastapi-mcp:8091/mcp
       # ── LLM provider: "openrouter" (default) or "mistral" ──────────────────
       LLM_PROVIDER: ${LLM_PROVIDER:-openrouter}
@@ -205,9 +253,16 @@ services:
       # OPENROUTER_API_KEY is read from .env
       # Mistral AI (used when LLM_PROVIDER=mistral)
       # MISTRAL_API_KEY and MISTRAL_MODEL are read from .env
+      # ── Redis chat session store ────────────────────────────────────────────
+      REDIS_URL: redis://redis:6379
+      CHAT_SESSION_TTL: ${CHAT_SESSION_TTL:-3600}   # seconds; default 1 hour
     depends_on:
-      - apollo-mcp-server
-      - fastapi-mcp
+      apollo-mcp-server:
+        condition: service_started   # distroless image — no healthcheck available
+      fastapi-mcp:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
 
   # ── React UI ────────────────────────────────────────────────────────────────
   # Nginx serves the built React app on :3000.
@@ -227,6 +282,7 @@ services:
 
 volumes:
   postgres-data:
+  redis-data:
 
 networks:
   shipment-net:

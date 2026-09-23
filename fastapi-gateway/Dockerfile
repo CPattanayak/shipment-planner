@@ -5,11 +5,8 @@ COPY requirements.txt .
 
 RUN pip install --upgrade pip
 
-# Install pyautogen FIRST so pip resolves flaml/openai versions around it.
-# Installing it last causes flaml[automl] to conflict with already-pinned deps.
-RUN pip install --no-cache-dir "pyautogen==0.2.35"
-
-# Install the rest; pip keeps versions already chosen above where compatible.
+# autogen-agentchat 0.4.x replaces pyautogen 0.2.x.
+# No pre-install workaround needed — flaml conflict was pyautogen-specific.
 RUN pip install --no-cache-dir --prefer-binary -r requirements.txt
 
 COPY . .

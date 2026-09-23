@@ -1,321 +1,265 @@
 """
-AutoGen Chat Router — SSE subscription API
-──────────────────────────────────────────
-Three endpoints form the chat contract:
+AutoGen Chat — Redis-backed, pure async, MCP-native tool discovery
+══════════════════════════════════════════════════════════════════
+Uses autogen_ext.tools.mcp.McpWorkbench to connect directly to the
+apollo-mcp-server so tool schemas are auto-discovered — no manual
+tool definitions, no threads, no queues.
 
-  POST   /api/chat/sessions                Create session + start AutoGen thread.
-                                           Body: { "firstMessage"?: "..." }
-                                           Returns: { "sessionId": "uuid" }
+  POST   /api/chat/sessions              Create session → {sessionId}
+  POST   /api/chat/{sessionId}           Send message → SSE stream
+  GET    /api/chat/{sessionId}/history   Full message history
+  DELETE /api/chat/{sessionId}           Delete session immediately
+  POST   /api/chat/{sessionId}/beacon    sendBeacon cleanup on tab close
 
-  GET    /api/chat/{sessionId}/stream      SSE subscription — push events to client.
-                                           Event types:
-                                             ready        — agent waiting for input
-                                             message      — assistant text reply
-                                             tool_call    — MCP tool being invoked
-                                             tool_result  — MCP tool response
-                                             error        — unrecoverable error
-                                             done         — session ended
-
-  POST   /api/chat/{sessionId}/send        User sends a message.
-                                           Body: { "message": "..." }
-                                           Returns: { "queued": true }
-
-  DELETE /api/chat/{sessionId}             Terminate session.
-
-Design
-──────
-  AutoGen runs in a background thread.
-  A threading.Queue bridges both directions:
-    out_q : AutoGen events   →  SSE generator (polled via run_in_executor)
-    in_q  : HTTP POST /send  →  AutoGen's get_human_input() (blocks thread)
-
-  The SSE generator uses FastAPI StreamingResponse (same pattern as /api/v1/stream
-  which is already proven to work in this gateway) and polls out_q via
-  run_in_executor so the asyncio event loop is never blocked.
+SSE event types:
+  tool_call    — MCP tool invoked  {tool, call_id, args}
+  tool_result  — MCP tool result   {call_id, content}
+  message      — assistant text    {content}
+  error        — unrecoverable     {content}
+  done         — turn complete
 """
 
-import asyncio
 import json
 import logging
-import queue as _tqueue
-import threading
+import os
 import uuid
-from typing import AsyncGenerator
 
+import redis as _redis_lib
 from fastapi import APIRouter, HTTPException
-from fastapi.responses import StreamingResponse
+from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel
 
-log = logging.getLogger("chat-router")
-# Raise to WARNING level so messages appear in docker logs without extra config
-logging.getLogger("chat-router").setLevel(logging.DEBUG)
+from autogen_agentchat.agents import AssistantAgent
+from autogen_agentchat.messages import (
+    TextMessage,
+    ToolCallRequestEvent,
+    ToolCallExecutionEvent,
+)
 
-router = APIRouter(prefix="/api/chat", tags=["Chat (AutoGen SSE)"])
+log = logging.getLogger(__name__)
+from autogen_ext.models.openai import OpenAIChatCompletionClient
+from autogen_ext.tools.mcp import McpWorkbench, StreamableHttpServerParams
 
+from config import (
+    LLM_PROVIDER,
+    OPENROUTER_API_KEY, OPENROUTER_BASE_URL, OPENROUTER_MODEL,
+    MISTRAL_API_KEY, MISTRAL_MODEL,
+    MCP_SERVER_URL,
+)
 
-# ── Session store ─────────────────────────────────────────────────────────────
+from chatbot import _SYSTEM_MESSAGE
 
-class _Session:
-    """One live AutoGen chatbot conversation."""
+router = APIRouter(prefix="/api/chat", tags=["Chat"])
 
-    def __init__(self):
-        # queue.Queue is thread-safe and supports get(timeout=…).
-        self.out_q: _tqueue.Queue = _tqueue.Queue()  # autogen → SSE
-        self.in_q:  _tqueue.Queue = _tqueue.Queue()  # user → autogen
-        self.alive: bool = True
+# ── Redis ──────────────────────────────────────────────────────────────────────
 
-    def push(self, event: dict) -> None:
-        """Thread-safe: enqueue an event for the SSE generator."""
-        log.warning("PUSH event: %s", event.get("type", "?"))
-        self.out_q.put(event)
-
-    def put_user_message(self, message: str) -> None:
-        """Thread-safe: queue a user message into the autogen thread."""
-        self.in_q.put(message)
-
-
-_sessions: dict[str, _Session] = {}
-
-_EXIT_WORDS = {"exit", "quit", "bye", "goodbye"}
+_r = _redis_lib.Redis.from_url(
+    os.getenv("REDIS_URL", "redis://redis:6379"),
+    decode_responses=True,
+)
+TTL = int(os.getenv("CHAT_SESSION_TTL", "3600"))
 
 
-# ── Agent background thread ───────────────────────────────────────────────────
+def get_state(session_id: str) -> dict | None:
+    data = _r.get(f"chat:{session_id}")
+    return json.loads(data) if data else None
 
-def _run_autogen(session: _Session, first_message: str) -> None:
+
+def save_state(session_id: str, state: dict) -> None:
+    _r.set(f"chat:{session_id}", json.dumps(state), ex=TTL)
+
+
+# ── Model client ───────────────────────────────────────────────────────────────
+
+def _make_model_client() -> OpenAIChatCompletionClient:
+    if LLM_PROVIDER == "mistral":
+        return OpenAIChatCompletionClient(
+            model=MISTRAL_MODEL,
+            api_key=MISTRAL_API_KEY,
+            base_url="https://api.mistral.ai/v1",
+        )
+    return OpenAIChatCompletionClient(
+        model=OPENROUTER_MODEL,
+        api_key=OPENROUTER_API_KEY,
+        base_url=OPENROUTER_BASE_URL,
+    )
+
+
+# ── MCP server params ──────────────────────────────────────────────────────────
+
+_MCP_PARAMS = StreamableHttpServerParams(url=MCP_SERVER_URL)
+
+
+# ── Core async streaming turn ──────────────────────────────────────────────────
+
+async def stream_chat(history: list[dict], user_input: str):
     """
-    Run a pyautogen 0.2.x conversation in a background thread.
+    Pure async generator — yields SSE-ready dicts for one conversation turn.
 
-    _StreamingAssistant overrides send() to push every assistant reply to the
-    SSE queue.  _QueueProxy overrides get_human_input() to block on the in_q
-    (fed by POST /send) and execute_function() to emit tool_call / tool_result
-    events before and after each MCP tool call.
+    McpWorkbench opens a connection to the MCP server, discovers all tools,
+    and hands them to AssistantAgent.  run_stream() drives the full
+    tool-call loop internally — we just forward the events.
     """
-    session.push({"type": "message", "role": "assistant",
-                  "content": "⚙️ AutoGen thread started — loading agent…"})
+    # Build the task: inject prior history as text context so the LLM has memory
+    if history:
+        ctx = "\n".join(
+            f"{'User' if m['role'] == 'user' else 'Assistant'}: {m['content']}"
+            for m in history[-20:]
+        )
+        task = f"[Conversation so far]\n{ctx}\n\n[New message]\n{user_input}"
+    else:
+        task = user_input
 
-    try:
-        import autogen
-    except ImportError:
-        session.push({"type": "error", "content": "pyautogen is not installed"})
-        session.push({"type": "done"})
-        return
+    final_content: list[str] = []
+    # Accumulate raw tool results so we can summarise them if autogen doesn't
+    # produce a TextMessage on its own (AssistantAgent.run_stream sometimes
+    # skips the follow-up LLM call when using McpWorkbench).
+    tool_results_for_summary: list[str] = []
 
-    from chatbot import (
-        _build_llm_config, _SYSTEM_MESSAGE,
-        get_warehouse_capacity, optimize_route,
-        get_available_carriers, get_carrier_quote,
-    )
-    push = session.push
-
-    # ── Subclasses that bridge AutoGen events → SSE queue ────────────────────
-
-    class _StreamingAssistant(autogen.AssistantAgent):
-        def send(self, message, recipient, request_reply=None, silent=False):
-            content = message if isinstance(message, str) else (message.get("content") or "")
-            if content.strip():
-                push({"type": "message", "role": "assistant", "content": content})
-            return super().send(message, recipient, request_reply, silent)
-
-    class _QueueProxy(autogen.UserProxyAgent):
-        def get_human_input(self, prompt: str) -> str:
-            # If the last assistant message has pending tool/function calls,
-            # return "" so AutoGen auto-executes them without blocking for user
-            # input.  Only ask the user for input when there are no tool calls.
-            last_msg = None
-            for msgs in self.chat_messages.values():
-                if msgs:
-                    last_msg = msgs[-1]
-            if last_msg and (last_msg.get("tool_calls") or last_msg.get("function_call")):
-                return ""   # auto-proceed → AutoGen will call execute_function
-
-            push({"type": "ready"})
-            try:
-                msg = session.in_q.get(timeout=600)
-            except _tqueue.Empty:
-                return "exit"
-            if msg.strip().lower() in _EXIT_WORDS:
-                session.alive = False
-            return msg
-
-        def execute_function(self, func_call, verbose=False):
-            name = func_call.get("name", "")
-            try:
-                args = json.loads(func_call.get("arguments", "{}"))
-            except json.JSONDecodeError:
-                args = {}
-            push({"type": "tool_call", "tool": name, "args": args})
-            result = super().execute_function(func_call, verbose)
-            push({"type": "tool_result", "tool": name, "content": str(result[1])})
-            return result
-
-    # ── Build LLM config ─────────────────────────────────────────────────────
-
-    try:
-        llm_config = _build_llm_config()
-    except SystemExit as exc:
-        session.push({"type": "error", "content": str(exc)})
-        session.push({"type": "done"})
-        return
-
-    # ── Create agents ─────────────────────────────────────────────────────────
-
-    assistant = _StreamingAssistant(
-        name="ShipmentPlannerBot",
-        system_message=_SYSTEM_MESSAGE,
-        llm_config=llm_config,
-    )
-    user_proxy = _QueueProxy(
-        name="User",
-        human_input_mode="ALWAYS",
-        is_termination_msg=lambda msg: (
-            "terminate" in (msg.get("content") or "").lower()
-        ),
-        code_execution_config=False,
-        # Must be > 0.  With max=0, check_termination_and_human_reply sees
-        # counter(0) >= max(0) → True and short-circuits BEFORE the function-
-        # call handler runs, producing "USER INTERRUPTED" for every tool call.
-        # A large value lets tool-call turns fall through to execute_function
-        # while human turns (non-empty get_human_input return) still route
-        # through the normal human-reply branch.
-        max_consecutive_auto_reply=100,
-    )
-
-    for fn in [get_warehouse_capacity, optimize_route,
-               get_available_carriers, get_carrier_quote]:
-        autogen.register_function(
-            fn,
-            caller=assistant,
-            executor=user_proxy,
-            description=fn.__doc__ or fn.__name__,
+    async with McpWorkbench(server_params=_MCP_PARAMS) as workbench:
+        agent = AssistantAgent(
+            name="ShipmentPlannerBot",
+            model_client=_make_model_client(),
+            workbench=workbench,
+            system_message=_SYSTEM_MESSAGE,
         )
 
-    # ── Run conversation ──────────────────────────────────────────────────────
+        async for event in agent.run_stream(task=task):
+            log.info("autogen event: %s  source=%s",
+                     type(event).__name__, getattr(event, "source", "—"))
 
-    try:
-        user_proxy.initiate_chat(assistant, message=first_message)
-    except Exception as exc:
-        log.error("AutoGen error: %s", exc, exc_info=True)
-        push({"type": "error", "content": str(exc)})
-    finally:
-        push({"type": "done"})
-        session.alive = False
+            if isinstance(event, ToolCallRequestEvent):
+                for tc in event.content:
+                    args = tc.arguments
+                    if isinstance(args, str):
+                        try:
+                            args = json.loads(args)
+                        except json.JSONDecodeError:
+                            pass
+                    yield {"type": "tool_call", "tool": tc.name,
+                           "call_id": tc.id, "args": args}
+
+            elif isinstance(event, ToolCallExecutionEvent):
+                for result in event.content:
+                    raw = str(result.content)
+                    tool_results_for_summary.append(
+                        f"Tool {result.call_id} result:\n{raw}"
+                    )
+                    yield {
+                        "type": "tool_result",
+                        "call_id": result.call_id,
+                        "content": raw,
+                    }
+
+            elif isinstance(event, TextMessage) and event.source not in ("user", ""):
+                log.info("TextMessage source=%r len=%d", event.source, len(event.content))
+                final_content.append(event.content)
+                yield {"type": "message", "content": event.content}
+
+    # ── Post-loop: if autogen never emitted a TextMessage, summarise manually ──
+    if not final_content:
+        if tool_results_for_summary:
+            log.info("no TextMessage received — calling LLM to summarise %d tool results",
+                     len(tool_results_for_summary))
+            summary_prompt = (
+                    f"The user asked: {user_input}\n\n"
+                    "The following tool results were returned:\n\n"
+                    + "\n\n".join(tool_results_for_summary)
+                    + "\n\nWrite a friendly, plain-language summary for the user. "
+                      "Use short bullet points. Do NOT show raw JSON or IDs."
+            )
+            model_client = _make_model_client()
+            from autogen_core.models import UserMessage as _UserMessage
+            try:
+                llm_resp = await model_client.create(
+                    [_UserMessage(content=summary_prompt, source="user")]
+                )
+                summary = (
+                    llm_resp.content
+                    if isinstance(llm_resp.content, str)
+                    else str(llm_resp.content)
+                )
+                log.info("summary generated len=%d", len(summary))
+                final_content.append(summary)
+                yield {"type": "message", "content": summary}
+            except Exception as exc:
+                log.error("summary LLM call failed: %s", exc)
+                yield {"type": "message",
+                       "content": "Tools ran successfully — ask me to explain the results."}
+        else:
+            log.warning("stream ended with no events at all")
+            yield {"type": "message",
+                   "content": "I didn't find anything to report. Could you clarify your request?"}
 
 
-# ── Request / response models ─────────────────────────────────────────────────
+# ── Request models ─────────────────────────────────────────────────────────────
 
-class CreateSessionRequest(BaseModel):
-    firstMessage: str = "Hello! I need help planning a shipment."
-
-
-class SendMessageRequest(BaseModel):
+class Message(BaseModel):
     message: str
 
 
-# ── Endpoints ─────────────────────────────────────────────────────────────────
+# ── Endpoints ──────────────────────────────────────────────────────────────────
 
 @router.post("/sessions")
-async def create_session(body: CreateSessionRequest):
-    """Create a new chat session and start the AutoGen conversation."""
+async def create_session():
+    """Create an empty session in Redis and return its ID."""
     session_id = str(uuid.uuid4())
-    session    = _Session()
-    _sessions[session_id] = session
-
-    thread = threading.Thread(
-        target=_run_autogen,
-        args=(session, body.firstMessage),
-        daemon=True,
-        name=f"autogen-{session_id[:8]}",
-    )
-    thread.start()
-    log.warning("chat session created: %s", session_id)
-
+    save_state(session_id, {"messages": []})
     return {"sessionId": session_id}
 
 
-@router.get("/{session_id}/stream")
-async def stream_session(session_id: str):
-    """
-    SSE subscription — receive all agent events for this session.
+@router.post("/{session_id}")
+async def chat(session_id: str, body: Message):
+    """Send one message — streams SSE events for the full tool-call + reply cycle."""
+    state = get_state(session_id)
+    if state is None:
+        raise HTTPException(status_code=404, detail="Session not found or expired")
 
-    Uses FastAPI StreamingResponse with text/event-stream media type (same
-    pattern as /api/v1/stream which is proven to work in this gateway).
-    out_q is polled via run_in_executor so the event loop is never blocked.
-    """
-    session = _sessions.get(session_id)
-    if not session:
-        raise HTTPException(status_code=404, detail="Session not found")
+    history  = state.get("messages", [])
+    user_msg = body.message
+    reply_parts: list[str] = []
 
-    log.warning("SSE stream opened: %s", session_id)
-
-    async def _generator() -> AsyncGenerator[bytes, None]:
-        loop = asyncio.get_running_loop()
-
-        # Send the SSE headers comment so the browser's EventSource knows
-        # the stream is alive immediately.
-        yield b": connected\n\n"
-
-        def _blocking_get() -> dict | None:
-            """Block a thread-pool worker for up to 25 s; return None on timeout."""
-            try:
-                item = session.out_q.get(timeout=25)
-                log.warning("SSE dequeued event type=%s", item.get("type", "?"))
-                return item
-            except _tqueue.Empty:
-                return None
-
+    async def _sse():
         try:
-            while True:
-                event = await loop.run_in_executor(None, _blocking_get)
-
-                if event is None:
-                    # Keep-alive comment (not a data event — won't trigger onmessage)
-                    log.warning("SSE keep-alive ping for %s", session_id)
-                    yield b"event: ping\ndata: {}\n\n"
-                    continue
-
-                payload = json.dumps(event)
-                log.warning("SSE yielding: %s", payload[:120])
-                yield f"data: {payload}\n\n".encode()
-
-                if event.get("type") == "done":
-                    _sessions.pop(session_id, None)
-                    break
-
-        except asyncio.CancelledError:
-            log.warning("SSE client disconnected: %s", session_id)
+            async for event in stream_chat(history, user_msg):
+                if event.get("type") == "message":
+                    reply_parts.append(event["content"])
+                yield f"data: {json.dumps(event)}\n\n"
         except Exception as exc:
-            log.error("SSE generator error: %s", exc, exc_info=True)
+            yield f"data: {json.dumps({'type': 'error', 'content': str(exc)})}\n\n"
+        finally:
+            save_state(session_id, {
+                "messages": history + [
+                    {"role": "user",      "content": user_msg},
+                    {"role": "assistant", "content": "".join(reply_parts)},
+                ]
+            })
+            yield f"data: {json.dumps({'type': 'done'})}\n\n"
 
     return StreamingResponse(
-        _generator(),
+        _sse(),
         media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "X-Accel-Buffering": "no",     # tell nginx not to buffer
-            "Connection": "keep-alive",
-        },
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
 
 
-@router.post("/{session_id}/send")
-async def send_message(session_id: str, body: SendMessageRequest):
-    """Send a user message to the AutoGen thread."""
-    session = _sessions.get(session_id)
-    if not session:
-        raise HTTPException(status_code=404, detail="Session not found or already closed")
-    if not session.alive and body.message.strip().lower() not in _EXIT_WORDS:
-        raise HTTPException(status_code=410, detail="Session has ended")
-
-    session.put_user_message(body.message)
-    log.warning("message queued → session %s: %.60s", session_id, body.message)
-    return {"queued": True}
+@router.get("/{session_id}/history")
+async def get_history(session_id: str):
+    state = get_state(session_id)
+    if state is None:
+        raise HTTPException(status_code=404, detail="Session not found or expired")
+    return {"sessionId": session_id, "messages": state.get("messages", []), "ttl": TTL}
 
 
 @router.delete("/{session_id}")
-async def close_session(session_id: str):
-    """Terminate a session by injecting an exit signal."""
-    session = _sessions.get(session_id)
-    if session:
-        session.put_user_message("exit")
-    _sessions.pop(session_id, None)
-    return {"closed": True}
+async def delete_session(session_id: str):
+    """Delete session from Redis immediately (user clicked End Session)."""
+    _r.delete(f"chat:{session_id}")
+    return {"deleted": True}
+
+
+@router.post("/{session_id}/beacon")
+async def beacon_delete(session_id: str):
+    """Fire-and-forget cleanup via navigator.sendBeacon() on tab close."""
+    _r.delete(f"chat:{session_id}")
+    return Response(status_code=204)

@@ -117,7 +117,14 @@ def planning_system_prompt() -> str:
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
+    import uvicorn
+
     versions = _list_versions()
     log.info("prompt-server starting  port=%d  active=%s  versions=%s",
              PORT, ACTIVE_VERSION, versions)
-    mcp.run(transport="streamable-http")
+
+    # FastMCP.run() doesn't expose host/port; get the ASGI app and run via
+    # uvicorn directly so the server binds to 0.0.0.0 (all interfaces) and
+    # is reachable from other containers on the Docker network.
+    app = mcp.streamable_http_app()
+    uvicorn.run(app, host="0.0.0.0", port=PORT)
